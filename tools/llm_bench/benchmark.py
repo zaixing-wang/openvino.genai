@@ -11,6 +11,7 @@ import traceback
 import llm_bench_utils.output_csv
 import llm_bench_utils.output_json
 import task.visual_language_generation as bench_vlm
+import task.visual_language_generation_chat as bench_vlm_chat
 import task.text_generation as bench_text
 import task.text_generation_chat as bench_text_chat
 import task.image_generation as bench_image
@@ -128,6 +129,14 @@ def get_argparser():
     parser.add_argument(
         "-lc",
         "--load_config",
+        default=None,
+        required=False,
+        help="""[DEPRECATED] please, use --ov-config \n
+        Path to JSON file or string in JSON format to load customized OpenVINO Runtime configurations.\n """,
+    )
+    parser.add_argument(
+        "-ov-c",
+        "--ov-config",
         default=None,
         required=False,
         help="""Path to JSON file or string in JSON format to load customized OpenVINO Runtime configurations.\n
@@ -284,13 +293,39 @@ def get_argparser():
         "--use_cb",
         action="store_true",
         help="Deprecated, will be removed soon! Continues batching mode is used by default. "
-        'To switch to SPDA mode, please, set up {"ATTENTION_BACKEND": "SDPA"} in --load_config.',
+        'To switch to SPDA mode, please, set up {"ATTENTION_BACKEND": "SDPA"} in --ov-config.',
     )
     parser.add_argument(
         "--cb_config",
         required=False,
         default=None,
         help="Path to file with Continuous Batching Scheduler settings or dict",
+    )
+    parser.add_argument(
+        "--session_snapshot_save",
+        required=False,
+        default=None,
+        help="Path to write a ContinuousBatchingPipeline session snapshot to. When set, each prompt is "
+        "generated for --session_snapshot_save_steps steps (instead of the full --infer_count) and then "
+        "saved via save_state(), instead of being benchmarked normally. Forces ContinuousBatchingPipeline "
+        "and requires batch_size=1, num_beams=1. Mutually exclusive with --session_snapshot_restore.",
+    )
+    parser.add_argument(
+        "--session_snapshot_save_steps",
+        default=5,
+        type=greater_than_zero,
+        help="Number of continuous-batching steps to run before saving via --session_snapshot_save "
+        "(roughly: enough steps to finish prefill plus a couple of decode steps).",
+    )
+    parser.add_argument(
+        "--session_snapshot_restore",
+        required=False,
+        default=None,
+        help="Path to a ContinuousBatchingPipeline session snapshot (written by --session_snapshot_save) to "
+        "restore via restore_state() instead of tokenizing/prefilling the prompt from scratch. The prompt "
+        "text/file is ignored; the request's token history comes entirely from the snapshot. Forces "
+        "ContinuousBatchingPipeline and requires batch_size=1, num_beams=1. Mutually exclusive with "
+        "--session_snapshot_save.",
     )
     parser.add_argument(
         "--draft_model",
@@ -306,6 +341,12 @@ def get_argparser():
         required=False,
         default=None,
         help="Path to file with Continuous Batching Scheduler settings or dict for Speculative decoding of draft model",
+    )
+    parser.add_argument(
+        "--draft-ov-config",
+        default=None,
+        required=False,
+        help="""Path to JSON file or string in JSON format to load customized OpenVINO Runtime configurations for draft model """,
     )
     parser.add_argument(
         "--num_assistant_tokens",
@@ -354,16 +395,21 @@ def get_argparser():
     parser.add_argument(
         "--streaming", action="store_true", help="Set whether to use streaming mode, only applicable to LLM."
     )
-    parser.add_argument("--num_steps", type=int, required=False, help="Number of inference steps for image generation")
+    parser.add_argument(
+        "--num_steps",
+        type=greater_than_zero,
+        required=False,
+        help="Number of inference steps for Image and Video Generation.",
+    )
     parser.add_argument(
         "--height",
-        type=int,
+        type=greater_than_zero,
         required=False,
         help="Generated image height. Applicable only for Image and Video Generation.",
     )
     parser.add_argument(
         "--width",
-        type=int,
+        type=greater_than_zero,
         required=False,
         help="Generated image width. Applicable only for Image and Video Generation.",
     )
@@ -380,7 +426,7 @@ def get_argparser():
     )
     parser.add_argument(
         "--num_frames",
-        type=int,
+        type=greater_than_zero,
         required=False,
         help="Number of frames in generated video. Applicable only for Video Generation.",
     )
@@ -400,6 +446,7 @@ def get_argparser():
             "text_gen_chat",
             "image_gen",
             "visual_text_gen",
+            "visual_text_gen_chat",
             "speech_to_text",
             "image_cls",
             "code_gen",
@@ -411,6 +458,7 @@ def get_argparser():
             "text-to-image",
             "image-to-image",
             "text-to-video",
+            "image-to-video",
             "inpainting",
         ],
         help="The task to setup the pipeline type",
@@ -554,6 +602,7 @@ CASE_TO_BENCH = {
     "ldm_super_resolution": bench_ldm_sr.run_ldm_super_resolution_benchmark,
     "speech_to_text": bench_speech.run_speech_2_txt_benchmark,
     "visual_text_gen": bench_vlm.run_visual_language_generation_benchmark,
+    "visual_text_gen_chat": bench_vlm_chat.run_visual_language_generation_benchmark,
     "text_embed": bench_text_embed.run_text_embddings_benchmark,
     "text_to_speech": bench_text_to_speech.run_text_2_speech_benchmark,
     "text_rerank": bench_text_rerank.run_text_reranker_benchmark,
@@ -587,6 +636,14 @@ def main():
         exit(1)
     if args.streaming and args.tokens_len is None:
         log.error("--streaming requires --tokens_len to be set.")
+        exit(1)
+    if args.session_snapshot_save is not None and args.session_snapshot_restore is not None:
+        log.error("--session_snapshot_save and --session_snapshot_restore are mutually exclusive.")
+        exit(1)
+    if (args.session_snapshot_save is not None or args.session_snapshot_restore is not None) and (
+        args.batch_size != 1 or args.num_beams != 1
+    ):
+        log.error("--session_snapshot_save/--session_snapshot_restore require batch_size=1 and num_beams=1.")
         exit(1)
     model_path, framework, model_args = analyze_args(args)
     # Set the device for running OpenVINO backend for torch.compile()
