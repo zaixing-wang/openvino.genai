@@ -13,10 +13,14 @@
 #include <openvino/runtime/auto/properties.hpp>
 
 #include <iostream>
+#include "openvino/core/except.hpp"
 #include "openvino/core/extension.hpp"
+#include "openvino/genai/automatic_speech_recognition/forced_aligner.hpp"
 #include "openvino/genai/extensions.hpp"
 #include "openvino/genai/image_generation/generation_config.hpp"
 #include "openvino/genai/llm_pipeline.hpp"
+#include "openvino/genai/omni/pipeline.hpp"
+#include "openvino/genai/omni/talker_speech_config.hpp"
 #include "openvino/genai/rag/text_embedding_pipeline.hpp"
 #include "openvino/genai/taylorseer_config.hpp"
 #include "openvino/genai/visual_language/pipeline.hpp"
@@ -145,7 +149,7 @@ ov::Any py_object_to_any(const py::object& py_obj, std::string property_name) {
         "DEVICE_PROPERTIES"
     };
 
-    py::object float_32_type = py::module_::import("numpy").attr("float32");
+    py::module_ numpy = py::module_::import("numpy");
     if (py::isinstance<py::str>(py_obj)) {
         if (property_name == "structural_tags_config") {
             std::variant<ov::genai::StructuralTagsConfig, ov::genai::StructuredOutputConfig::StructuralTag>
@@ -159,10 +163,12 @@ ov::Any py_object_to_any(const py::object& py_obj, std::string property_name) {
         return py_obj.cast<std::string>();
     } else if (py::isinstance<py::float_>(py_obj)) {
         return py_obj.cast<float>();
-    } else if (py::isinstance(py_obj, float_32_type)) {
+    } else if (py::isinstance(py_obj, numpy.attr("floating"))) {
         return py_obj.cast<float>();
-    } else if (py::isinstance<py::int_>(py_obj)) {
+    } else if (py::isinstance<py::int_>(py_obj) || py::isinstance(py_obj, numpy.attr("integer"))) {
         return py_obj.cast<int64_t>();
+    } else if (py::isinstance(py_obj, numpy.attr("bool_"))) {
+        return py_obj.cast<bool>();
     } else if (py::isinstance<py::none>(py_obj)) {
         return {};
     } else if (py::isinstance<py::list>(py_obj)) {
@@ -429,6 +435,8 @@ ov::Any py_object_to_any(const py::object& py_obj, std::string property_name) {
         return py::cast<ov::genai::SchedulerConfig>(py_obj);
     } else if (py::isinstance<ov::genai::AdapterConfig>(py_obj)) {
         return py::cast<ov::genai::AdapterConfig>(py_obj);
+    } else if (py::isinstance<ov::genai::OmniTalkerSpeechConfig>(py_obj)) {
+        return py::cast<ov::genai::OmniTalkerSpeechConfig>(py_obj);
     } else if (py::isinstance<ov::genai::StructuralTagItem>(py_obj)) {
         return py::cast<ov::genai::StructuralTagItem>(py_obj);
     } else if (py::isinstance<ov::genai::StructuralTagsConfig>(py_obj)) {
@@ -477,6 +485,8 @@ ov::Any py_object_to_any(const py::object& py_obj, std::string property_name) {
         std::shared_ptr<ov::genai::Generator> wrapper =
             std::make_shared<GilSafeGeneratorWrapper>(std::move(impl), py::reinterpret_borrow<py::object>(py_obj));
         return wrapper;
+    } else if (py::isinstance<ov::genai::ASRForcedAligner>(py_obj)) {
+        return py::cast<std::shared_ptr<ov::genai::ASRForcedAligner>>(py_obj);
     } else if (py::isinstance<py::function>(py_obj) && property_name == "callback") {
         auto py_callback = py::cast<py::function>(py_obj);
         auto shared_callback = std::shared_ptr<py::function>(new py::function(py_callback), [](py::function* f) {
@@ -499,15 +509,9 @@ ov::Any py_object_to_any(const py::object& py_obj, std::string property_name) {
         auto streamer = py::cast<ov::genai::pybind::utils::PyBindStreamerVariant>(py_obj);
         return ov::genai::streamer(pystreamer_to_streamer(streamer)).second;
     } else if ((py::isinstance<py::function>(py_obj) || py::isinstance<ov::genai::OmniSpeechStreamerBase>(py_obj)) &&
-               property_name == "audio_streamer") {
-        auto audio_streamer = py::cast<ov::genai::pybind::utils::PyBindOmniSpeechStreamerVariant>(py_obj);
-        auto converted = py_speech_streamer_to_streamer(audio_streamer);
-        // Store the unwrapped concrete type so get_audio_streamer_from_map can .is<T>() it
-        return std::visit(
-            [](auto&& val) -> ov::Any {
-                return ov::Any(val);
-            },
-            converted);
+               property_name == ov::genai::utils::SPEECH_STREAMER_ARG_NAME) {
+        auto speech_streamer = py::cast<ov::genai::pybind::utils::PyBindOmniSpeechStreamerVariant>(py_obj);
+        return ov::genai::speech_streamer(py_speech_streamer_to_streamer(speech_streamer)).second;
     } else if (py::isinstance(py_obj, py::module_::import("pathlib").attr("Path"))) {
         return py::cast<std::filesystem::path>(py_obj);
     }
@@ -715,6 +719,66 @@ py::object json_container_to_py_object(const ov::genai::JsonContainer& container
     std::string json_string = container.to_json_string();
     py::module_ json_module = py::module_::import("json");
     return json_module.attr("loads")(json_string);
+}
+
+py::object any_to_py_object(const ov::Any& any) {
+    if (any.empty()) {
+        return py::none();
+    }
+    if (any.is<std::string>()) {
+        return py::cast(any.as<std::string>());
+    }
+    if (any.is<bool>()) {
+        return py::cast(any.as<bool>());
+    }
+    if (any.is<int>()) {
+        return py::cast(any.as<int>());
+    }
+    if (any.is<int64_t>()) {
+        return py::cast(any.as<int64_t>());
+    }
+    if (any.is<size_t>()) {
+        return py::cast(any.as<size_t>());
+    }
+    if (any.is<float>()) {
+        return py::cast(any.as<float>());
+    }
+    if (any.is<double>()) {
+        return py::cast(any.as<double>());
+    }
+    if (any.is<ov::AnyMap>()) {
+        return any_map_to_py_object(any.as<ov::AnyMap>());
+    }
+    if (any.is<std::vector<std::string>>()) {
+        return py::cast(any.as<std::vector<std::string>>());
+    }
+    if (any.is<std::vector<int64_t>>()) {
+        return py::cast(any.as<std::vector<int64_t>>());
+    }
+    if (any.is<std::vector<double>>()) {
+        return py::cast(any.as<std::vector<double>>());
+    }
+    if (any.is<std::vector<float>>()) {
+        return py::cast(any.as<std::vector<float>>());
+    }
+    if (any.is<std::vector<ov::Any>>()) {
+        py::list items;
+        for (const ov::Any& item : any.as<std::vector<ov::Any>>()) {
+            items.append(any_to_py_object(item));
+        }
+        return items;
+    }
+    OPENVINO_THROW("Cannot convert ov::Any to a Python object: unsupported stored type '",
+                   any.type_info().name(),
+                   "'");
+}
+
+py::dict any_map_to_py_object(const ov::AnyMap& any_map) {
+    py::dict result;
+    for (const auto& [key, value] : any_map) {
+        result[py::str(key)] = any_to_py_object(value);
+    }
+    return result;
 }
 
 }  // namespace ov::genai::pybind::utils

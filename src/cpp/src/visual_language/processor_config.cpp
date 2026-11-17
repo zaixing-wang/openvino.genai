@@ -10,8 +10,31 @@
 
 ov::genai::ProcessorConfig::ProcessorConfig(const nlohmann::json& parsed) {
     using ov::genai::utils::read_json_param;
+
     read_json_param(parsed, "image_size", image_size);
-    read_json_param(parsed, "patch_size", patch_size); // For llava - stored in config.json vision_config
+
+    // patch_size can be an integer (LLaVA) or an object {"height": N, "width": N} (Pixtral)
+    if (parsed.contains("patch_size") && parsed["patch_size"].is_object()) {
+        size_t patch_size_height = 0;
+        size_t patch_size_width = 0;
+        read_json_param(parsed, "patch_size.height", patch_size_height);
+        read_json_param(parsed, "patch_size.width", patch_size_width);
+        OPENVINO_ASSERT(patch_size_height > 0 && patch_size_width > 0,
+                        "patch_size object must specify positive height and width, got height=",
+                        patch_size_height,
+                        ", width=",
+                        patch_size_width);
+        OPENVINO_ASSERT(patch_size_height == patch_size_width,
+                        "Non-square patch_size is not supported: height=",
+                        patch_size_height,
+                        ", width=",
+                        patch_size_width);
+        patch_size = patch_size_height;
+    } else {
+        read_json_param(parsed, "patch_size", patch_size);
+        OPENVINO_ASSERT(patch_size > 0, "patch_size must be positive, got ", patch_size);
+    }
+
     read_json_param(parsed, "scale_resolution", scale_resolution);
     read_json_param(parsed, "max_slice_nums", max_slice_nums);
 
@@ -38,6 +61,12 @@ ov::genai::ProcessorConfig::ProcessorConfig(const nlohmann::json& parsed) {
     read_json_param(parsed, "temporal_patch_size", temporal_patch_size);
     read_json_param(parsed, "merge_size", merge_size);
 
+    // Setting DeepSeek-OCR-2 config params
+    read_json_param(parsed, "tile_size", tile_size);
+    read_json_param(parsed, "min_patches", min_patches);
+    read_json_param(parsed, "max_patches", max_patches);
+    read_json_param(parsed, "background_color", background_color);
+
     // Setting qwen3_vl config params
     // qwen3_vl uses size.shortest_edge and size.longest_edge instead of min_pixels and max_pixels
     if (!parsed.contains("min_pixels") && !parsed.contains("max_pixels") ||
@@ -55,6 +84,22 @@ ov::genai::ProcessorConfig::ProcessorConfig(const nlohmann::json& parsed) {
     // Setting gemma4 config params
     read_json_param(parsed, "pooling_kernel_size", pooling_kernel_size);
     read_json_param(parsed, "max_soft_tokens", max_soft_tokens);
+
+    // Setting mistral3 (pixtral) config params
+    read_json_param(parsed, "size.longest_edge", longest_edge);
+    OPENVINO_ASSERT(longest_edge > 0, "longest_edge must be positive, got ", longest_edge);
+
+    read_processor_options(parsed);
+}
+
+void ov::genai::ProcessorConfig::read_processor_options(const nlohmann::json& processor_config) {
+    using ov::genai::utils::read_json_param;
+    // Setting molmo2 processor options
+    read_json_param(processor_config, "image_use_col_tokens", image_use_col_tokens);
+    read_json_param(processor_config, "use_single_crop_col_tokens", use_single_crop_col_tokens);
+    read_json_param(processor_config, "use_single_crop_start_token", use_single_crop_start_token);
+    read_json_param(processor_config, "video_use_col_tokens", video_use_col_tokens);
+    read_json_param(processor_config, "use_frame_special_tokens", use_frame_special_tokens);
 }
 
 ov::genai::ProcessorConfig::ProcessorConfig(const std::filesystem::path& json_path)
@@ -80,5 +125,9 @@ ov::genai::ProcessorConfig ov::genai::ProcessorConfig::from_any_map(
     read_anymap_param(config_map, "max_image_tokens", extracted_config.max_image_tokens);
     read_anymap_param(config_map, "pooling_kernel_size", extracted_config.pooling_kernel_size);
     read_anymap_param(config_map, "max_soft_tokens", extracted_config.max_soft_tokens);
+    read_anymap_param(config_map, "image_size", extracted_config.image_size);
+    read_anymap_param(config_map, "window_kernel_size", extracted_config.window_kernel_size);
+    read_anymap_param(config_map, "merge_kernel_size", extracted_config.merge_kernel_size);
+    read_anymap_param(config_map, "longest_edge", extracted_config.longest_edge);
     return extracted_config;
 }

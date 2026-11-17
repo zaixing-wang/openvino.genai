@@ -11,6 +11,7 @@ import traceback
 import llm_bench_utils.output_csv
 import llm_bench_utils.output_json
 import task.visual_language_generation as bench_vlm
+import task.visual_language_generation_chat as bench_vlm_chat
 import task.text_generation as bench_text
 import task.text_generation_chat as bench_text_chat
 import task.image_generation as bench_image
@@ -130,6 +131,14 @@ def get_argparser():
         "--load_config",
         default=None,
         required=False,
+        help="""[DEPRECATED] please, use --ov-config \n
+        Path to JSON file or string in JSON format to load customized OpenVINO Runtime configurations.\n """,
+    )
+    parser.add_argument(
+        "-ov-c",
+        "--ov-config",
+        default=None,
+        required=False,
         help="""Path to JSON file or string in JSON format to load customized OpenVINO Runtime configurations.\n
         Example for OpenVINO: {"INFERENCE_PRECISION_HINT": "f32", "KV_CACHE_PRECISION": "f32", "DYNAMIC_QUANTIZATION_GROUP_SIZE": 0}\n
         Additional option for OpenVINO GenAI: {"ATTENTION_BACKEND": "SDPA"}\n
@@ -178,7 +187,7 @@ def get_argparser():
     parser.add_argument(
         "--memory_sampler",
         default="base",
-        choices=["base", "win-gpu", "full"],
+        choices=["base", "win-gpu", "full", "mac"],
         type=str.lower,  # normalise e.g. 'WIN-GPU'/'Full' -> 'win-gpu'/'full' before choices validation
         required=False,
         help="Memory sampler implementation to use when process-based monitoring is active\n"
@@ -198,7 +207,11 @@ def get_argparser():
         "  full           — MemorySamplerFull: same RAM metrics as base plus uss, pss\n"
         "                   and swap from psutil.memory_full_info() (reads /proc smaps).\n"
         "                   More accurate 'real' footprint but slower. Linux only;\n"
-        "                   falls back to MemorySamplerBase on other platforms.",
+        "                   on macOS falls back to mac, elsewhere to base.\n"
+        "  mac            — MemorySamplerMac: same RAM metrics as base plus foot, the\n"
+        "                   physical footprint from libproc proc_pid_rusage (what\n"
+        "                   Activity Monitor shows: incl. compressed and GPU/Metal\n"
+        "                   memory). macOS only; falls back to base on other platforms.",
     )
     parser.add_argument("-bs", "--batch_size", type=int, default=1, required=False, help="Batch size value")
     parser.add_argument(
@@ -284,7 +297,7 @@ def get_argparser():
         "--use_cb",
         action="store_true",
         help="Deprecated, will be removed soon! Continues batching mode is used by default. "
-        'To switch to SPDA mode, please, set up {"ATTENTION_BACKEND": "SDPA"} in --load_config.',
+        'To switch to SPDA mode, please, set up {"ATTENTION_BACKEND": "SDPA"} in --ov-config.',
     )
     parser.add_argument(
         "--cb_config",
@@ -306,6 +319,12 @@ def get_argparser():
         required=False,
         default=None,
         help="Path to file with Continuous Batching Scheduler settings or dict for Speculative decoding of draft model",
+    )
+    parser.add_argument(
+        "--draft-ov-config",
+        default=None,
+        required=False,
+        help="""Path to JSON file or string in JSON format to load customized OpenVINO Runtime configurations for draft model """,
     )
     parser.add_argument(
         "--num_assistant_tokens",
@@ -354,16 +373,21 @@ def get_argparser():
     parser.add_argument(
         "--streaming", action="store_true", help="Set whether to use streaming mode, only applicable to LLM."
     )
-    parser.add_argument("--num_steps", type=int, required=False, help="Number of inference steps for image generation")
+    parser.add_argument(
+        "--num_steps",
+        type=greater_than_zero,
+        required=False,
+        help="Number of inference steps for Image and Video Generation.",
+    )
     parser.add_argument(
         "--height",
-        type=int,
+        type=greater_than_zero,
         required=False,
         help="Generated image height. Applicable only for Image and Video Generation.",
     )
     parser.add_argument(
         "--width",
-        type=int,
+        type=greater_than_zero,
         required=False,
         help="Generated image width. Applicable only for Image and Video Generation.",
     )
@@ -380,7 +404,7 @@ def get_argparser():
     )
     parser.add_argument(
         "--num_frames",
-        type=int,
+        type=greater_than_zero,
         required=False,
         help="Number of frames in generated video. Applicable only for Video Generation.",
     )
@@ -400,6 +424,7 @@ def get_argparser():
             "text_gen_chat",
             "image_gen",
             "visual_text_gen",
+            "visual_text_gen_chat",
             "speech_to_text",
             "image_cls",
             "code_gen",
@@ -411,6 +436,7 @@ def get_argparser():
             "text-to-image",
             "image-to-image",
             "text-to-video",
+            "image-to-video",
             "inpainting",
         ],
         help="The task to setup the pipeline type",
@@ -511,6 +537,26 @@ def get_argparser():
         ),
     )
     parser.add_argument(
+        "--speech_instruct",
+        type=str,
+        default="",
+        help="Instruction text for Qwen3-TTS VoiceDesign/CustomVoice models.",
+    )
+    parser.add_argument(
+        "--speech_ref_audio",
+        dest="speech_ref_audio",
+        type=str,
+        default="",
+        help="Reference WAV file path for Qwen3-TTS Base voice cloning (required for Base models).",
+    )
+    parser.add_argument(
+        "--speech_ref_text",
+        dest="speech_ref_text",
+        type=str,
+        default="",
+        help="Optional reference transcript for Qwen3-TTS Base ICL mode.",
+    )
+    parser.add_argument(
         "-vf",
         "--video_frames",
         type=int,
@@ -554,6 +600,7 @@ CASE_TO_BENCH = {
     "ldm_super_resolution": bench_ldm_sr.run_ldm_super_resolution_benchmark,
     "speech_to_text": bench_speech.run_speech_2_txt_benchmark,
     "visual_text_gen": bench_vlm.run_visual_language_generation_benchmark,
+    "visual_text_gen_chat": bench_vlm_chat.run_visual_language_generation_benchmark,
     "text_embed": bench_text_embed.run_text_embddings_benchmark,
     "text_to_speech": bench_text_to_speech.run_text_2_speech_benchmark,
     "text_rerank": bench_text_rerank.run_text_reranker_benchmark,
