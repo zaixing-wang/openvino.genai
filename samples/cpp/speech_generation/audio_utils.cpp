@@ -3,8 +3,9 @@
 
 #include "audio_utils.hpp"
 
+#include <cstring>
 #include <fstream>
-#include <iostream>
+#include <memory>
 #include <vector>
 
 #include "openvino/core/except.hpp"
@@ -12,14 +13,30 @@
 #define DR_WAV_IMPLEMENTATION
 #include <dr_wav.h>
 
-namespace utils {
-namespace audio {
+#ifdef _WIN32
+#    include <fcntl.h>
+#    include <io.h>
+#endif
 
-void save_to_wav(const float* waveform_ptr,
-                 size_t waveform_size,
-                 const std::filesystem::path& file_path,
-                 uint32_t bits_per_sample,
-                 uint32_t sample_rate) {
+namespace {
+bool is_wav_buffer(const std::string& buf) {
+    // RIFF ref: https://en.wikipedia.org/wiki/Resource_Interchange_File_Format
+    // WAV ref: https://www.mmsp.ece.mcgill.ca/Documents/AudioFormats/WAVE/WAVE.html
+    if (buf.size() < 12 || buf.substr(0, 4) != "RIFF" || buf.substr(8, 4) != "WAVE") {
+        return false;
+    }
+
+    // memcpy, not a uint32_t* cast: offset 4 of a string buffer is not guaranteed to be aligned.
+    uint32_t chunk_size;
+    std::memcpy(&chunk_size, buf.data() + 4, sizeof(chunk_size));
+    if (chunk_size + 8 != buf.size()) {
+        return false;
+    }
+
+    return true;
+}
+
+void open_wav_writer(drwav& wav, const std::filesystem::path& file_path, uint32_t bits_per_sample, uint32_t sample_rate) {
     drwav_data_format format;
     format.container = drwav_container_riff;
     format.format = DR_WAVE_FORMAT_IEEE_FLOAT;
@@ -27,16 +44,130 @@ void save_to_wav(const float* waveform_ptr,
     format.sampleRate = sample_rate;
     format.bitsPerSample = bits_per_sample;
 
-    drwav wav;
     OPENVINO_ASSERT(drwav_init_file_write(&wav, file_path.string().c_str(), &format, nullptr),
                     "Failed to initialize WAV writer");
+}
+}  // namespace
 
-    size_t total_samples = waveform_size * format.channels;
+namespace utils {
+namespace audio {
 
-    drwav_uint64 frames_written = drwav_write_pcm_frames(&wav, total_samples, waveform_ptr);
-    OPENVINO_ASSERT(frames_written == total_samples, "Failed to write not all frames");
+ov::genai::RawSpeechInput read_wav(const std::string& filename, uint32_t expected_sample_rate) {
+    drwav wav;
+    std::vector<uint8_t> wav_data;  // used for pipe input from stdin
+
+    if (filename == "-") {
+        {
+#ifdef _WIN32
+            _setmode(_fileno(stdin), _O_BINARY);
+#endif
+
+            uint8_t buf[1024];
+            while (true) {
+                const size_t n = fread(buf, 1, sizeof(buf), stdin);
+                if (n == 0) {
+                    break;
+                }
+                wav_data.insert(wav_data.end(), buf, buf + n);
+            }
+        }
+
+        OPENVINO_ASSERT(drwav_init_memory(&wav, wav_data.data(), wav_data.size(), nullptr),
+                        "Failed to open WAV file from stdin");
+    } else if (is_wav_buffer(filename)) {
+        OPENVINO_ASSERT(drwav_init_memory(&wav, filename.c_str(), filename.size(), nullptr),
+                        "Failed to open WAV file from fname buffer");
+    } else if (!drwav_init_file(&wav, filename.c_str(), nullptr)) {
+        throw std::runtime_error("failed to open as WAV file");
+    }
+
+    if (wav.channels != 1 && wav.channels != 2) {
+        drwav_uninit(&wav);
+        throw std::runtime_error("WAV file must be mono or stereo");
+    }
+
+    if (wav.sampleRate != expected_sample_rate) {
+        drwav_uninit(&wav);
+        throw std::runtime_error("WAV file must be " + std::to_string(expected_sample_rate / 1000) + " kHz");
+    }
+
+    // drwav_uninit invalidates the struct, so keep what we still need for the conversion below.
+    const auto channels = wav.channels;
+
+    // The header's frame count, not the buffer size: an in-memory buffer also holds the header.
+    std::vector<float> interleaved_pcmf32(wav.totalPCMFrameCount * channels);
+    const uint64_t n = drwav_read_pcm_frames_f32(&wav, wav.totalPCMFrameCount, interleaved_pcmf32.data());
+    drwav_uninit(&wav);
+
+    // convert to mono, float
+    std::vector<float> pcmf32;
+    pcmf32.resize(n);
+    if (channels == 1) {
+        for (uint64_t i = 0; i < n; i++) {
+            pcmf32[i] = interleaved_pcmf32[i];
+        }
+    } else {
+        for (uint64_t i = 0; i < n; i++) {
+            pcmf32[i] = (interleaved_pcmf32[2 * i] + interleaved_pcmf32[2 * i + 1]) * 0.5f;
+        }
+    }
+
+    return pcmf32;
+}
+
+ov::Tensor read_wav_as_tensor(const std::string& filename, uint32_t expected_sample_rate) {
+    ov::genai::RawSpeechInput pcm = read_wav(filename, expected_sample_rate);
+    const size_t sample_count = pcm.size();
+
+    // Move the decoded samples into an allocator so the tensor owns them directly, avoiding a
+    // copy of the PCM buffer. Mirrors SharedImageAllocator in visual_language_chat/load_image.cpp.
+    // The buffer is held via shared_ptr so copying the allocator is cheap and ownership is unambiguous.
+    struct SharedPcmAllocator {
+        std::shared_ptr<std::vector<float>> pcm;
+        void* allocate(size_t bytes, size_t) const {
+            OPENVINO_ASSERT(bytes == pcm->size() * sizeof(float),
+                            "Unexpected number of bytes was requested to allocate.");
+            return pcm->data();
+        }
+        void deallocate(void*, size_t, size_t) const noexcept {}
+        bool is_equal(const SharedPcmAllocator& other) const noexcept {
+            return pcm == other.pcm;
+        }
+    };
+    return ov::Tensor(ov::element::f32,
+                      ov::Shape{sample_count},
+                      SharedPcmAllocator{std::make_shared<std::vector<float>>(std::move(pcm))});
+}
+
+void save_to_wav(const float* waveform_ptr,
+                 size_t waveform_size,
+                 const std::filesystem::path& file_path,
+                 uint32_t bits_per_sample,
+                 uint32_t sample_rate) {
+    drwav wav;
+    open_wav_writer(wav, file_path, bits_per_sample, sample_rate);
+
+    drwav_uint64 frames_written = drwav_write_pcm_frames(&wav, waveform_size, waveform_ptr);
+    OPENVINO_ASSERT(frames_written == waveform_size, "Failed to write not all frames");
 
     drwav_uninit(&wav);
+}
+
+struct WavWriter::Impl {
+    drwav wav;
+};
+
+WavWriter::WavWriter(const std::filesystem::path& file_path, uint32_t sample_rate) : m_impl{std::make_unique<Impl>()} {
+    open_wav_writer(m_impl->wav, file_path, 32, sample_rate);
+}
+
+WavWriter::~WavWriter() {
+    drwav_uninit(&m_impl->wav);
+}
+
+void WavWriter::write(const float* samples, size_t sample_count) {
+    drwav_uint64 frames_written = drwav_write_pcm_frames(&m_impl->wav, sample_count, samples);
+    OPENVINO_ASSERT(frames_written == sample_count, "Failed to write not all frames");
 }
 
 ov::Tensor read_speaker_embedding(const std::filesystem::path& file_path, const ov::Shape& shape) {

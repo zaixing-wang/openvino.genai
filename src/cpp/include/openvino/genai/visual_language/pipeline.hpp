@@ -3,11 +3,15 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 #include <filesystem>
 
+#include "openvino/core/except.hpp"
 #include "openvino/genai/llm_pipeline.hpp"
+#include "openvino/genai/omni/streamer_base.hpp"
+#include "openvino/genai/omni/talker_results.hpp"
 #include "openvino/genai/streamer_base.hpp"
 #include "openvino/genai/tokenizer.hpp"
 #include "openvino/genai/visual_language/perf_metrics.hpp"
@@ -32,6 +36,10 @@ public:
     // Outer index is per return sequence, aligned with intermediate_hidden_states;
     // inner is prompt tokens followed by that sequence's generated tokens.
     std::vector<std::vector<int64_t>> full_token_ids;
+
+    /// Speech output. VLMPipeline fills it only for LFM3-Omni when talker_speech_config.return_audio is true;
+    /// empty for other models. OmniPipeline also fills it for Qwen3-Omni. Preview API: subject to change.
+    TalkerResults speech_result;
 };
 
 /**
@@ -50,8 +58,8 @@ public:
     /// @brief Generate a response given a prompt and any number of
     /// uint8 RGB images with [NHWC] or [HWC] layout.
     /// @param prompt A prompt to respond to.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param images Images to be prepended to a prompt.
     /// @param generation_config A config to follow for text generation.
     /// @param streamer A streamer to acquire intermediate result.
@@ -65,8 +73,8 @@ public:
 
     /// @brief Generate a response given a prompt and uint8 RGB image with [NHWC] or [HWC] layout.
     /// @param prompt A prompt to respond to.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param images Image to be prepended to a prompt.
     /// @param videos Multiple videos, each providing multiple frames, to be prepended to a prompt.
     /// @param generation_config A config to follow for text generation.
@@ -82,8 +90,8 @@ public:
 
     /// @brief Generate a response given a prompt and a single uint8 RGB image with [NHWC] or [HWC] layout.
     /// @param prompt A prompt to respond to.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param image Image to be prepended to a prompt.
     /// @param generation_config A config to follow for text generation.
     /// @param streamer A streamer to acquire intermediate result.
@@ -97,8 +105,8 @@ public:
 
     /// @brief Generate a response given a prompt and config.
     /// @param prompt A prompt to respond to.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param config_map A config may contain GenerationConfig, values
     /// for its members, StreamerVariant, a single image or multiple
     /// images/videos, and audios.
@@ -110,8 +118,8 @@ public:
     /// @brief Generate a response given a chat history and any number of
     /// uint8 RGB images with [NHWC] or [HWC] layout.
     /// @param history Chat history with messages.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param images Images to be associated with the last chat history user message.
     /// @param generation_config A config to follow for text generation.
     /// @param streamer A streamer to acquire intermediate result.
@@ -124,8 +132,8 @@ public:
     /// @brief Generate a response given a chat history and any number of
     /// uint8 RGB images/videos with [NHWC] layout.
     /// @param history Chat history with messages.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param images Images to be associated with the last chat history user message.
     /// @param videos Videos (each providing multiple frames) to be associated with the last chat history user message.
     /// @param generation_config A config to follow for text generation.
@@ -139,8 +147,8 @@ public:
 
     /// @brief Generate a response given a chat history and a single uint8 RGB image with [NHWC] or [HWC] layout.
     /// @param history Chat history with messages.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param image Image to be associated with the last chat history user message.
     /// @param generation_config A config to follow for text generation.
     /// @param streamer A streamer to acquire intermediate result.
@@ -154,8 +162,8 @@ public:
 
     /// @brief Generate a response given a chat history and config.
     /// @param history Chat history with messages.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param config_map A config may contain GenerationConfig, values
     /// for its members, StreamerVariant, a single image or multiple
     /// images/videos, and audios.
@@ -190,7 +198,8 @@ public:
 
     /// @brief videos_metadata-aware generate. Forwards to the backing implementation; used by
     /// OmniPipeline to drive Qwen3-VL-style timestamp prompts. `audios` carries raw audio inputs
-    /// (Qwen3-Omni); conventional VLM implementations ignore it.
+    /// (Qwen3-Omni). A model with no audio tower throws instead of dropping the audio, so a
+    /// non-empty `audios` on a conventional VLM implementation is an error, not a no-op.
     virtual VLMDecodedResults generate(const std::string& prompt,
                                        const std::vector<ov::Tensor>& images,
                                        const std::vector<ov::Tensor>& videos,
@@ -207,6 +216,42 @@ public:
                                        const std::vector<VideoMetadata>& videos_metadata,
                                        const GenerationConfig& generation_config,
                                        const StreamerVariant& streamer) = 0;
+
+    /// @brief Omni-streaming generate: additionally pushes every decode step's tokens and thinker
+    /// hidden states into `omni_streamer` as they are produced, so a talker reading the other end
+    /// of the same object can generate speech while text generation is still running. Used by
+    /// OmniPipeline; `omni_streamer` is null for conventional VLM use.
+    ///
+    /// Overriding is optional: this overload exists only to serve
+    /// `GenerationConfig::stream_text2speech`. With a null `omni_streamer` the default delegates to the
+    /// non-streaming overload above; with a non-null one it throws `ov::NotImplemented` rather than
+    /// quietly dropping the streamer and producing no speech. A backend that skips it still supports
+    /// non-streaming speech output in full — OmniPipeline calls the non-streaming overload above when
+    /// streaming is off.
+    /// @note This is a preview API and is subject to change.
+    virtual VLMDecodedResults generate(const std::string& prompt,
+                                       const std::vector<ov::Tensor>& images,
+                                       const std::vector<ov::Tensor>& videos,
+                                       const std::vector<ov::Tensor>& audios,
+                                       const std::vector<VideoMetadata>& videos_metadata,
+                                       const GenerationConfig& generation_config,
+                                       const StreamerVariant& streamer,
+                                       const std::shared_ptr<OmniStreamerBase>& omni_streamer);
+
+    /// @brief ChatHistory form of the omni-streaming generate above; same optional-override contract.
+    /// OmniPipeline uses this one for its ChatHistory overload rather than applying the chat template
+    /// itself and calling the string form: the multimodal normalization that places image and audio
+    /// tags inside the user message only happens on the ChatHistory path, and going through a
+    /// templated string changes the Thinker's output.
+    /// @note This is a preview API and is subject to change.
+    virtual VLMDecodedResults generate(const ChatHistory& history,
+                                       const std::vector<ov::Tensor>& images,
+                                       const std::vector<ov::Tensor>& videos,
+                                       const std::vector<ov::Tensor>& audios,
+                                       const std::vector<VideoMetadata>& videos_metadata,
+                                       const GenerationConfig& generation_config,
+                                       const StreamerVariant& streamer,
+                                       const std::shared_ptr<OmniStreamerBase>& omni_streamer);
 
     /// @brief Backend capability: true when the active execution path emits the per-step hidden
     /// states the talker consumes. Depends on how the model was loaded — only the continuous-batching
@@ -296,8 +341,8 @@ public:
     /// @brief Generate a response given a prompt and any number of
     /// uint8 RGB images with [NHWC] or [HWC] layout.
     /// @param prompt A prompt to respond to.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param images Images to be prepended to a prompt.
     /// @param generation_config A config to follow for text generation.
     /// @param streamer A streamer to acquire intermediate result.
@@ -313,8 +358,8 @@ public:
 
     /// @brief Generate a response given a prompt and uint8 RGB image with [NHWC] or [HWC] layout.
     /// @param prompt A prompt to respond to.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param images Image to be prepended to a prompt.
     /// @param videos Multiple videos, each providing multiple frames, to be prepended to a prompt.
     /// @param generation_config A config to follow for text generation.
@@ -332,8 +377,8 @@ public:
 
     /// @brief Generate a response given a prompt and a single uint8 RGB image with [NHWC] or [HWC] layout.
     /// @param prompt A prompt to respond to.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param image Image to be prepended to a prompt.
     /// @param generation_config A config to follow for text generation.
     /// @param streamer A streamer to acquire intermediate result.
@@ -347,8 +392,8 @@ public:
 
     /// @brief Generate a response given a prompt and config.
     /// @param prompt A prompt to respond to.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param config_map A config may contain GenerationConfig, values
     /// for its members, StreamerVariant, a single image or multiple
     /// images/videos, and audios.
@@ -365,8 +410,8 @@ public:
     /// Example:
     /// generate("text", image(rgb), do_sample(true));
     /// @param prompt A prompt to respond to.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param ...properties ov::Property instances to be combined into
     /// ov::AnyMap.
     /// @return VLMDecodedResults structure containing generated texts, scores and perf metrics.
@@ -385,8 +430,8 @@ public:
     /// @brief Generate a response given a chat history and any number of
     /// uint8 RGB images with [NHWC] or [HWC] layout.
     /// @param history Chat history with messages.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param images Images to be associated with the last chat history user message.
     /// @param generation_config A config to follow for text generation.
     /// @param streamer A streamer to acquire intermediate result.
@@ -401,8 +446,8 @@ public:
     /// @brief Generate a response given a chat history and any number of
     /// uint8 RGB images/videos with [NHWC] layout.
     /// @param history Chat history with messages.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param images Images to be associated with the last chat history user message.
     /// @param videos Videos (each providing multiple frames) to be associated with the last chat history user message.
     /// @param generation_config A config to follow for text generation.
@@ -418,7 +463,8 @@ public:
 
     /// @brief videos_metadata-aware generate. Forwards to the backing implementation; used by
     /// OmniPipeline to drive Qwen3-VL-style timestamp prompts. `audios` carries raw audio inputs
-    /// (Qwen3-Omni); conventional VLM implementations ignore it.
+    /// (Qwen3-Omni). A model with no audio tower throws instead of dropping the audio, so a
+    /// non-empty `audios` on a conventional VLM implementation is an error, not a no-op.
     VLMDecodedResults generate(
         const std::string& prompt,
         const std::vector<ov::Tensor>& images,
@@ -440,10 +486,39 @@ public:
         const StreamerVariant& streamer
     ) override;
 
+    /// @brief Omni-streaming generate. Forwards to the backing implementation; see VLMPipelineBase.
+    /// Only the continuous-batching backend can feed a talker — the SDPA fallback throws when
+    /// `omni_streamer` is non-null.
+    /// @note This is a preview API and is subject to change.
+    VLMDecodedResults generate(
+        const std::string& prompt,
+        const std::vector<ov::Tensor>& images,
+        const std::vector<ov::Tensor>& videos,
+        const std::vector<ov::Tensor>& audios,
+        const std::vector<VideoMetadata>& videos_metadata,
+        const GenerationConfig& generation_config,
+        const StreamerVariant& streamer,
+        const std::shared_ptr<OmniStreamerBase>& omni_streamer
+    ) override;
+
+    /// @brief ChatHistory form of the omni-streaming generate. Forwards to the backing
+    /// implementation; see VLMPipelineBase.
+    /// @note This is a preview API and is subject to change.
+    VLMDecodedResults generate(
+        const ChatHistory& history,
+        const std::vector<ov::Tensor>& images,
+        const std::vector<ov::Tensor>& videos,
+        const std::vector<ov::Tensor>& audios,
+        const std::vector<VideoMetadata>& videos_metadata,
+        const GenerationConfig& generation_config,
+        const StreamerVariant& streamer,
+        const std::shared_ptr<OmniStreamerBase>& omni_streamer
+    ) override;
+
     /// @brief Generate a response given a chat history and a single uint8 RGB image with [NHWC] or [HWC] layout.
     /// @param history Chat history with messages.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param image Image to be associated with the last chat history user message.
     /// @param generation_config A config to follow for text generation.
     /// @param streamer A streamer to acquire intermediate result.
@@ -458,8 +533,8 @@ public:
     /// @brief Generate a response given a chat history and arbitrary number
     /// of ov::Property instances.
     /// @param history Chat history with messages.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param config_map A config may contain GenerationConfig, values
     /// for its members, StreamerVariant, a single image or multiple
     /// images/videos, and audios.
@@ -471,8 +546,8 @@ public:
 
     /// @brief Generate a response given a chat history and config.
     /// @param history Chat history with messages.
-    /// For using image and video tags in prompt, see:
-    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-image-or-video-tags-in-prompt
+    /// For using media tags in prompt, see:
+    /// https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/visual-processing/#use-media-tags-in-prompt
     /// @param ...properties ov::Property instances to be combined into
     /// ov::AnyMap.
     /// @return VLMDecodedResults structure containing generated texts, scores and perf metrics.

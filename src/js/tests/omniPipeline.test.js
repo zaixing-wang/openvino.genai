@@ -1,0 +1,209 @@
+// Copyright (C) 2023-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+
+import os from "node:os";
+import assert from "node:assert";
+import { describe, it, before } from "node:test";
+import { addon as ov } from "openvino-node";
+import { createTestImageTensor, createTestRawSpeech, createTestVideoTensor } from "./utils.js";
+import {
+  OmniPipeline,
+  DecodedResults,
+  VLMDecodedResults,
+  OmniDecodedResults,
+  ChatHistory,
+  SpeechOutputMode,
+  StreamingStatus,
+} from "../dist/index.js";
+
+const { OMNI_PATH } = process.env;
+const deterministicSpeechConfig = {
+  return_audio: true,
+  max_new_tokens: 4,
+  talker_top_k: 1,
+  cp_top_k: 1,
+};
+
+// Skip for macOS due to continuous batching backend requires PagedAttention operation support
+describe("OmniPipeline", { skip: os.platform() === "darwin" }, () => {
+  let pipeline, testImage, testAudio, testVideo;
+
+  before(async () => {
+    pipeline = await OmniPipeline(OMNI_PATH, "CPU");
+    testImage = createTestImageTensor();
+    testVideo = createTestVideoTensor();
+    const speech = createTestRawSpeech({ durationSeconds: 0.2 });
+    testAudio = new ov.Tensor("f32", [speech.length], speech);
+  });
+
+  it("should generate text without speech", async () => {
+    const result = await pipeline.generate("What is 2+2?", {
+      textConfig: { max_new_tokens: 20 },
+      talkerSpeechConfig: { return_audio: false },
+    });
+
+    assert.ok(result instanceof DecodedResults, "Result should be instance of DecodedResults");
+    assert.ok(
+      result instanceof VLMDecodedResults,
+      "Result should be instance of VLMDecodedResults",
+    );
+    assert.ok(
+      result instanceof OmniDecodedResults,
+      "Result should be instance of OmniDecodedResults",
+    );
+    assert.ok(result.texts.length > 0, "Should generate some output");
+    assert.strictEqual(result.speechResult.waveforms.length, 0, "No speech expected");
+  });
+
+  it("should generate text with an image and audio", async () => {
+    const result = await pipeline.generate("Describe the inputs.", {
+      images: [testImage],
+      audios: [testAudio],
+      textConfig: { max_new_tokens: 20 },
+      talkerSpeechConfig: { return_audio: false },
+    });
+    assert.strictEqual(result.texts.length, 1);
+  });
+
+  it("should generate text with a video and metadata", async () => {
+    const result = await pipeline.generate("Describe the video.", {
+      videos: [testVideo],
+      videosMetadata: [{ fps: 2, frames_indices: [0, 2] }],
+      textConfig: { max_new_tokens: 20 },
+      talkerSpeechConfig: { return_audio: false },
+    });
+    assert.strictEqual(result.texts.length, 1);
+  });
+
+  it("should generate speech waveforms", async () => {
+    const result = await pipeline.generate("Say hello.", {
+      textConfig: { max_new_tokens: 20 },
+      talkerSpeechConfig: deterministicSpeechConfig,
+    });
+    assert.ok(result.speechResult.waveforms.length > 0, "Should produce speech waveforms");
+    assert.strictEqual(
+      typeof result.speechResult.perfMetrics.numGeneratedSamples,
+      "number",
+      "Speech perf metrics should report the number of generated samples",
+    );
+  });
+
+  it("should generate the same text and speech while text is still being generated", async () => {
+    const generate = (streamText2Speech) =>
+      pipeline.generate("Say hello.", {
+        textConfig: { max_new_tokens: 20, stream_text2speech: streamText2Speech },
+        talkerSpeechConfig: deterministicSpeechConfig,
+      });
+    const batch = await generate(false);
+    const streamed = await generate(true);
+
+    assert.ok(streamed instanceof OmniDecodedResults);
+    assert.deepStrictEqual(streamed.texts, batch.texts);
+    assert.strictEqual(streamed.speechResult.waveforms.length, 1);
+    assert.deepStrictEqual(
+      streamed.speechResult.waveforms[0].data,
+      batch.speechResult.waveforms[0].data,
+      "The talker must produce the same waveform from the thinker's output arriving step by step",
+    );
+  });
+
+  it("should stream text and speech chunks", async () => {
+    let textChunks = 0;
+    let audioChunks = 0;
+    const result = await pipeline.generate("Count to three.", {
+      textConfig: {
+        max_new_tokens: 4,
+        ignore_eos: true,
+        structured_output_config: { regex: "a+" },
+      },
+      talkerSpeechConfig: deterministicSpeechConfig,
+      streamer: () => {
+        textChunks++;
+        return StreamingStatus.RUNNING;
+      },
+      speechStreamer: () => {
+        audioChunks++;
+        return StreamingStatus.RUNNING;
+      },
+    });
+    assert.ok(textChunks > 0, "Text streamer should be called");
+    assert.ok(audioChunks > 0, "Speech streamer should be called");
+    assert.ok(result instanceof OmniDecodedResults);
+  });
+
+  it("should stop generation from the text streamer", async () => {
+    let textChunks = 0;
+    const result = await pipeline.generate("Count to ten.", {
+      textConfig: {
+        max_new_tokens: 4,
+        ignore_eos: true,
+        structured_output_config: { regex: "a+" },
+      },
+      talkerSpeechConfig: { return_audio: false },
+      streamer: () => {
+        textChunks++;
+        return StreamingStatus.STOP;
+      },
+    });
+
+    assert.ok(textChunks > 0, "Text streamer should be called before stopping");
+    assert.ok(result instanceof OmniDecodedResults);
+  });
+
+  it("should reject concurrent generation calls without releasing the active call", async () => {
+    const activeGeneration = pipeline.generate("Count to ten.", {
+      textConfig: { max_new_tokens: 20, ignore_eos: true },
+      talkerSpeechConfig: { return_audio: false },
+    });
+
+    await assert.rejects(
+      pipeline.generate("Second request.", {
+        talkerSpeechConfig: { return_audio: false },
+      }),
+      /Another generation is already in progress/,
+    );
+    await assert.rejects(
+      pipeline.generate("Third request.", {
+        talkerSpeechConfig: { return_audio: false },
+      }),
+      /Another generation is already in progress/,
+    );
+    await activeGeneration;
+  });
+
+  for (const [field, value, message] of [
+    ["output_mode", SpeechOutputMode.SPEECH_ONLY, /output_mode applies to models/],
+    ["cp_repetition_penalty", 1.1, /cp_repetition_penalty applies to LFM3-Omni only/],
+  ]) {
+    it(`should reject ${field} for a model with a separate talker`, async () => {
+      await assert.rejects(
+        pipeline.generate("Hi", {
+          textConfig: { max_new_tokens: 4 },
+          talkerSpeechConfig: { ...deterministicSpeechConfig, [field]: value },
+        }),
+        message,
+      );
+    });
+  }
+
+  it("should reject a non-integer output_mode", async () => {
+    await assert.rejects(
+      pipeline.generate("Hi", {
+        textConfig: { max_new_tokens: 4 },
+        talkerSpeechConfig: { ...deterministicSpeechConfig, output_mode: 0.5 },
+      }),
+      /Invalid talkerSpeechConfig.output_mode: 0.5/,
+    );
+  });
+
+  it("should generate with ChatHistory", async () => {
+    const history = new ChatHistory();
+    history.push({ role: "user", content: "Hello" });
+    const result = await pipeline.generate(history, {
+      textConfig: { max_new_tokens: 20 },
+      talkerSpeechConfig: { return_audio: false },
+    });
+    assert.ok(result instanceof OmniDecodedResults);
+    assert.strictEqual(result.texts.length, 1);
+  });
+});

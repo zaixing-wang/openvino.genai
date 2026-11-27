@@ -7,12 +7,14 @@ import json
 import pytest
 import shutil
 import logging
+import uuid
 import requests
 from importlib import metadata
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from utils.network import retry_request
+from utils.export import export_command
 from utils.constants import (
     get_ov_cache_dir,
     get_ov_cache_downloaded_models_dir,
@@ -47,18 +49,13 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "gguf_filename": "SmolLM2-135M.F16.gguf",
         "convert_args": ['--trust-remote-code']
     },
-    "SmolLM2-360M": {
-        "name": "HuggingFaceTB/SmolLM2-360M",
-        "convert_args": ['--trust-remote-code']
+    "SmolLM2-360M": {"name": "HuggingFaceTB/SmolLM2-360M", "convert_args": ["--trust-remote-code"]},
+    "WhisperTiny": {"name": "openai/whisper-tiny", "convert_args": ["--trust-remote-code", "--weight-format", "fp16"]},
+    "tiny-random-sense-voice-small": {
+        "name": "optimum-intel-internal-testing/tiny-random-sense-voice-small",
+        "convert_args": ["--trust-remote-code"],
     },
-    "WhisperTiny": {
-        "name": "openai/whisper-tiny",
-        "convert_args": ['--trust-remote-code', '--weight-format', 'fp16']
-    },
-    "Qwen2.5-0.5B-Instruct": {
-        "name": "Qwen/Qwen2.5-0.5B-Instruct",
-        "convert_args": ['--trust-remote-code']
-    },
+    "Qwen2.5-0.5B-Instruct": {"name": "Qwen/Qwen2.5-0.5B-Instruct", "convert_args": ["--trust-remote-code"]},
     "Qwen2.5-0.5B-Instruct-GGUF": {
         "name": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
         "gguf_filename": "qwen2.5-0.5b-instruct-q4_0.gguf",
@@ -104,6 +101,11 @@ MODELS: Dict[str, Dict[str, Any]] = {
     "tiny-random-phi3-vision": {
         "name": "optimum-intel-internal-testing/tiny-random-phi3-vision",
         "convert_args": ['--trust-remote-code', "--task", "image-text-to-text"]
+    },
+    "tiny-random-molmo2": {
+        # Exported by genai-cli (optimum_cli_convert dispatches natively converted models to it).
+        "name": "optimum-intel-internal-testing/tiny-random-molmo2",
+        "convert_args": ["--trust-remote-code"],
     },
     "InternVL2-1B": {
         "name": "OpenGVLab/InternVL2-1B",
@@ -161,6 +163,18 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "name": "hf-internal-testing/tiny-random-SpeechT5ForTextToSpeech",
         "convert_args": ["--model-kwargs",  json.dumps({"vocoder": "fxmarty/speecht5-hifigan-tiny"})]
     },
+    "tiny-random-qwen3-tts": {
+        "name": "optimum-intel-internal-testing/tiny-random-qwen3-tts",
+        "convert_args": ["--trust-remote-code"],
+    },
+    "tiny-random-qwen3-tts-customvoice": {
+        "name": "optimum-intel-internal-testing/tiny-random-qwen3-tts-customvoice",
+        "convert_args": ["--trust-remote-code"],
+    },
+    "tiny-random-qwen3-tts-voicedesign": {
+        "name": "optimum-intel-internal-testing/tiny-random-qwen3-tts-voicedesign",
+        "convert_args": ["--trust-remote-code"],
+    },
     "Qwen3-1.7B": {
         "name": "Qwen/Qwen3-1.7B",
         "convert_args": ["--task", "text-generation-with-past", "--trust-remote-code"],
@@ -185,6 +199,14 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "name": "optimum-intel-internal-testing/tiny-random-ltx-video",
         "convert_args": ["--trust-remote-code"],
     },
+    "tiny-random-ltx2": {
+        "name": "optimum-intel-internal-testing/tiny-random-ltx2",
+        "convert_args": ["--trust-remote-code"],
+    },
+    "tiny-random-ltx2.3": {
+        "name": "optimum-intel-internal-testing/tiny-random-ltx2.3",
+        "convert_args": ["--trust-remote-code"],
+    },
     "tiny-random-flux": {
         "name": "optimum-intel-internal-testing/tiny-random-flux",
         "convert_args": ["--trust-remote-code", "--weight-format", "fp16"],
@@ -197,8 +219,16 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "name": "optimum-intel-internal-testing/tiny-random-qwen3-vl",
         "convert_args": ["--trust-remote-code", "--task", "image-text-to-text"],
     },
+    "tiny-random-gemma4": {
+        "name": "optimum-intel-internal-testing/tiny-random-gemma4",
+        "convert_args": ["--trust-remote-code", "--task", "image-text-to-text"],
+    },
     "tiny-random-qwen3-omni": {
         "name": "optimum-intel-internal-testing/tiny-random-qwen3-omni",
+        "convert_args": ["--trust-remote-code", "--task", "image-text-to-text"],
+    },
+    "tiny-random-lfm3-omni": {
+        "name": "optimum-intel-internal-testing/tiny-random-lfm3-omni",
         "convert_args": ["--trust-remote-code", "--task", "image-text-to-text"],
     },
     "tiny-random-qwen3-vl-embedding": {
@@ -320,7 +350,7 @@ def download_gguf_model(model: Dict[str, Any], model_path: str) -> None:
 
 
 def optimum_cli_convert(model, model_path):
-    """Convert the model using optimum-cli."""
+    """Convert the model using optimum-cli, or genai-cli when it converts the model natively."""
     sub_env = os.environ.copy()
     model_name = model["name"]
     model_args = model["convert_args"]
@@ -329,13 +359,7 @@ def optimum_cli_convert(model, model_path):
     manager = AtomicDownloadManager(dest_path)
     
     def convert_to_temp(temp_path: Path) -> None:
-        command = [
-            "optimum-cli", "export", "openvino",
-            "--model", model_name, 
-            str(temp_path)
-        ]
-        if model_args:
-            command.extend(model_args)
+        command = export_command(model_name, temp_path, model_args or [])
         logger.info(f"Conversion command: {' '.join(command)}")
         retry_request(
             lambda: subprocess.run(
@@ -352,7 +376,7 @@ def optimum_cli_convert(model, model_path):
     try:
         manager.execute(convert_to_temp)
     except subprocess.CalledProcessError as error:
-        logger.error(f"optimum-cli returned {error.returncode}. Output:\n{error.output}")
+        logger.error(f"{error.cmd[0]} returned {error.returncode}. Output:\n{error.output}")
         raise
 
 
@@ -464,11 +488,18 @@ def download_test_content(request):
         if not os.path.exists(file_path):
             logger.info(f"Downloading test content from {file_url} to {file_path}...")
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            response = requests.get(file_url, stream=True)
-            response.raise_for_status()
-            with open(file_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
+            temp_path = f"{file_path}.tmp_{uuid.uuid4().hex[:8]}"
+            try:
+                response = requests.get(file_url, stream=True)
+                response.raise_for_status()
+                with open(temp_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                os.replace(temp_path, file_path)
+            except Exception:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise
             logger.info(f"Downloaded test content to {file_path}")
         else:
             logger.info(f"Test content already exists at {file_path}")

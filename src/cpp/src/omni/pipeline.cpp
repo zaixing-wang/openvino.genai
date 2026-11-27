@@ -7,14 +7,35 @@
 
 #include "omni/pipeline_impl.hpp"
 #include "omni/talker_speech_config_utils.hpp"
+#include "utils.hpp"
+#include "visual_language/vlm_config.hpp"
 
 namespace ov::genai {
+
+std::pair<std::string, Any> speech_streamer(OmniSpeechStreamerVariant func) {
+    if (std::holds_alternative<std::monostate>(func)) {
+        return {utils::SPEECH_STREAMER_ARG_NAME, Any()};
+    } else if (auto* streamer_obj = std::get_if<std::shared_ptr<OmniSpeechStreamerBase>>(&func)) {
+        return {utils::SPEECH_STREAMER_ARG_NAME, Any::make<std::shared_ptr<OmniSpeechStreamerBase>>(*streamer_obj)};
+    } else {
+        auto callback = std::get<std::function<StreamingStatus(const ov::Tensor&)>>(func);
+        return {utils::SPEECH_STREAMER_ARG_NAME,
+                Any::make<std::function<StreamingStatus(const ov::Tensor&)>>(callback)};
+    }
+}
 
 OmniPipeline::OmniPipeline(const std::filesystem::path& models_path,
                            const std::string& device,
                            const ov::AnyMap& properties)
-    : OmniPipeline(std::make_shared<VLMPipeline>(models_path, device, properties),
-                   std::make_shared<Talker>(models_path, device, properties)) {}
+    : m_pimpl([&] {
+          auto vlm = std::make_shared<VLMPipeline>(models_path, device, properties);
+          // LFM3-Omni speaks in the language model stream and has no separate talker.
+          const auto vlm_config = utils::from_config_json_if_exists<VLMConfig>(models_path, "config.json");
+          if (vlm_config.model_type == VLMModelType::LFM3_OMNI) {
+              return std::make_unique<OmniPipelineImpl>(vlm);
+          }
+          return std::make_unique<OmniPipelineImpl>(vlm, std::make_shared<Talker>(models_path, device, properties));
+      }()) {}
 
 OmniPipeline::OmniPipeline(const std::shared_ptr<VLMPipelineBase>& vlm,
                            const std::shared_ptr<TalkerBase>& talker)
@@ -190,6 +211,11 @@ struct ExtractedOmniProps {
 
 ExtractedOmniProps extract_omni_props(const ov::AnyMap& config_map) {
     ExtractedOmniProps out;
+    // Both streamers are stored as the concrete variant alternative, not the variant, so they are
+    // read with the shared helpers that type-test the ov::Any. Casting straight to the variant
+    // would throw "Bad as from: ...".
+    out.streamer = utils::get_streamer_from_map(config_map);
+    out.speech_streamer = utils::get_speech_streamer_from_map(config_map);
     for (const auto& [property_key, value] : config_map) {
         if (property_key == ov::genai::images.name()) {
             out.images = value.as<std::vector<ov::Tensor>>();
@@ -203,11 +229,7 @@ ExtractedOmniProps extract_omni_props(const ov::AnyMap& config_map) {
             out.explicit_text_config = value.as<GenerationConfig>();
         } else if (property_key == ov::genai::talker_speech_config.name()) {
             out.explicit_talker_speech_config = value.as<OmniTalkerSpeechConfig>();
-        } else if (property_key == "streamer") {
-            out.streamer = value.as<StreamerVariant>();
-        } else if (property_key == ov::genai::speech_streamer.name()) {
-            out.speech_streamer = value.as<OmniSpeechStreamerVariant>();
-        } else {
+        } else if (property_key != utils::STREAMER_ARG_NAME && property_key != utils::SPEECH_STREAMER_ARG_NAME) {
             out.leftover.emplace(property_key, value);
         }
     }

@@ -3,6 +3,7 @@ import pytest
 import logging
 import shutil
 import subprocess  # nosec B404
+import sys
 
 from pathlib import Path
 from typing import Any, Callable, Dict
@@ -34,6 +35,15 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "name": "Qwen/Qwen3-Reranker-0.6B",
         "convert_args": ["--trust-remote-code", "--task", "text-generation"],
     },
+    "tiny-random-Phi3ForCausalLM": {
+        "name": "optimum-intel-internal-testing/tiny-random-Phi3ForCausalLM",
+        "convert_args": ["--trust-remote-code", "--task", "text-generation"],
+    },
+    "Qwen2.5-0.5B-Instruct": {
+        "name": "Qwen/Qwen2.5-0.5B-Instruct",
+        "cache_name": "Qwen2.5-0.5B-Instruct-v2",
+        "convert_args": ["--trust-remote-code"],
+    },
     "tiny-random-qwen2vl": {
         "name": "optimum-intel-internal-testing/tiny-random-qwen2vl",
         "convert_args": ["--trust-remote-code", "--task", "image-text-to-text"],
@@ -41,6 +51,22 @@ MODELS: Dict[str, Dict[str, Any]] = {
     "tiny-random-qwen3-omni": {
         "name": "optimum-intel-internal-testing/tiny-random-qwen3-omni",
         "convert_args": ["--trust-remote-code", "--task", "image-text-to-text"],
+    },
+    "tiny-random-gemma4": {
+        "name": "optimum-intel-internal-testing/tiny-random-gemma4",
+        "convert_args": ["--task", "image-text-to-text"],
+    },
+    "tiny-random-fun-asr": {
+        "name": "optimum-intel-internal-testing/tiny-random-fun-asr",
+        "convert_args": ["--weight-format", "fp32"],
+    },
+    "tiny-random-qwen3-asr": {
+        "name": "optimum-intel-internal-testing/tiny-random-qwen3-asr",
+        "convert_args": ["--task", "automatic-speech-recognition"],
+    },
+    "whisper-tiny": {
+        "name": "openai/whisper-tiny",
+        "convert_args": ["--weight-format", "fp32"],
     },
     "tiny-random-llava-next-video": {
         "name": "optimum-intel-internal-testing/tiny-random-llava-next-video",
@@ -54,6 +80,10 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "name": "optimum-intel-internal-testing/tiny-random-llava",
         "convert_args": ["--trust-remote-code", "--task", "image-text-to-text"],
     },
+    "tiny-random-mistral3": {
+        "name": "optimum-intel-internal-testing/tiny-random-mistral3",
+        "convert_args": ["--trust-remote-code", "--task", "image-text-to-text"],
+    },
     "Qwen2-VL-2B-Instruct": {
         "name": "Qwen/Qwen2-VL-2B-Instruct",
         "convert_args": ["--trust-remote-code", "--task", "image-text-to-text"],
@@ -63,6 +93,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
     "tiny-random-flux": {"name": "optimum-intel-internal-testing/tiny-random-flux", "convert_args": []},
     "tiny-random-flux-fill": {"name": "optimum-intel-internal-testing/tiny-random-flux-fill", "convert_args": []},
     "tiny-random-ltx-video": {"name": "optimum-intel-internal-testing/tiny-random-ltx-video", "convert_args": []},
+    "tiny-random-ltx2": {"name": "optimum-intel-internal-testing/tiny-random-ltx2", "convert_args": []},
     "tiny-videochat-flash-qwen": {
         "name": "optimum-intel-internal-testing/tiny-videochat-flash-qwen",
         "convert_args": ["--trust-remote-code", "--task", "image-text-to-text"],
@@ -74,6 +105,18 @@ MODELS: Dict[str, Dict[str, Any]] = {
     "Kokoro-82M": {
         "name": "hexgrad/Kokoro-82M",
         "convert_args": ["--trust-remote-code"],
+    },
+    "Qwen3-TTS-12Hz-1.7B-VoiceDesign": {
+        "name": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+        "convert_args": ["--trust-remote-code", "--weight-format", "fp32"],
+    },
+    "Qwen3-TTS-12Hz-1.7B-CustomVoice": {
+        "name": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        "convert_args": ["--trust-remote-code", "--weight-format", "fp32"],
+    },
+    "Qwen3-TTS-12Hz-0.6B-Base": {
+        "name": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        "convert_args": ["--trust-remote-code", "--weight-format", "fp32"],
     },
     "tiny-random-qwen3-vl-embedding": {
         "name": "optimum-intel-internal-testing/tiny-random-qwen3-vl-embedding",
@@ -119,7 +162,8 @@ def convert_model(model_name: str) -> str:
     model_id = parts[1]
 
     convert_args = MODELS[model_id]["convert_args"]
-    model_path = Path(models_dir) / f"wwb_{model_id}"
+    cache_name = MODELS[model_id].get("cache_name", model_id)
+    model_path = Path(models_dir) / f"wwb_{cache_name}"
 
     manager = AtomicDownloadManager(model_path)
 
@@ -132,9 +176,7 @@ def convert_model(model_name: str) -> str:
         if "--weight-format" not in convert_args:
             convert_args.extend(["--weight-format", "fp16"])
         command = [
-            "optimum-cli",
-            "export",
-            "openvino",
+            *_export_tool(MODELS[model_id]["name"]),
             "--model",
             MODELS[model_id]["name"],
             *convert_args,
@@ -146,10 +188,26 @@ def convert_model(model_name: str) -> str:
     try:
         manager.execute(convert)
     except subprocess.CalledProcessError as error:
-        logger.exception(f"optimum-cli returned {error.returncode}. Output:\n{error.stderr}")
+        logger.exception(f"{error.cmd[0]} returned {error.returncode}. Output:\n{error.stderr}")
         raise
 
     return str(model_path)
+
+
+def _export_tool(model: str) -> list[str]:
+    """genai-cli for the models it converts natively, optimum-cli for all others (same export options).
+
+    Mirrors export_command of tests/python_tests/utils/export.py, which the WWB tests cannot import. WWB can be
+    installed next to an openvino-genai release that has no genai-cli, hence the ImportError fallback.
+    """
+    try:
+        from openvino_genai._cli.main import native_exporter_for_model
+
+        if native_exporter_for_model(model)[1] is not None:
+            return [sys.executable, "-m", "openvino_genai._cli", "export"]
+    except ImportError:  # openvino_genai built without genai-cli
+        pass
+    return ["optimum-cli", "export", "openvino"]
 
 
 @pytest.fixture(scope="session", autouse=True)

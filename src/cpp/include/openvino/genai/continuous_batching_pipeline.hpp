@@ -140,6 +140,7 @@ protected:
     class ContinuousBatchingForSpeculativeDecodingImpl;
     class ContinuousBatchingForEagle3DecodingImpl;
     class ContinuousBatchingForMtpDecodingImpl;
+    class ContinuousBatchingForDFlashDecodingImpl;
     class ContinuousBatchingForPromptLookupImpl;
     class SpeculativeDecodingImpl;
     class Eagle3DecodingImpl;
@@ -152,6 +153,7 @@ protected:
     friend class ContinuousBatchingForPromptLookupImpl;
     friend class ContinuousBatchingForEagle3DecodingImpl;
     friend class ContinuousBatchingForMtpDecodingImpl;
+    friend class ContinuousBatchingForDFlashDecodingImpl;
     friend class SpeculativeDecodingImpl;
     friend class Eagle3DecodingImpl;
     friend class DFlashDecodingImpl;
@@ -279,10 +281,13 @@ public:
     ov::genai::PipelineMetrics get_metrics() const;
 
     /// @param request_id must be unique for every add_request() call.
+    /// @note LoRA adapters are only supported in MODE_STATIC or MODE_FUSE modes.
+    ///       MODE_DYNAMIC, MODE_AUTO and MODE_STATIC_RANK are not supported in the add_request() + step() flow.
     GenerationHandle add_request(uint64_t request_id, const ov::Tensor& input_ids, const ov::genai::GenerationConfig& sampling_params);
     GenerationHandle add_request(uint64_t request_id, const std::string& prompt, const ov::genai::GenerationConfig& sampling_params);
     GenerationHandle add_request(uint64_t request_id, const std::string& prompt, const std::vector<ov::Tensor>& images, const ov::genai::GenerationConfig& sampling_params);
     GenerationHandle add_request(uint64_t request_id, const std::string& prompt, const std::vector<ov::Tensor>& images, const std::vector<ov::Tensor>& videos, const ov::genai::GenerationConfig& sampling_params);
+    GenerationHandle add_request(uint64_t request_id, const std::string& prompt, const std::vector<ov::Tensor>& images, const std::vector<ov::Tensor>& videos, const std::vector<ov::Tensor>& audios, const ov::genai::GenerationConfig& sampling_params);
 
     GenerationHandle add_request(uint64_t request_id, const std::string& prompt, const ov::AnyMap& properties_map);
 

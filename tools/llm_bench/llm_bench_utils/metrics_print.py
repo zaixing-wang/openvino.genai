@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import logging as log
 import sys
+from llm_bench_utils.gen_output_data import get_end_to_end_token_throughput
 
 MAX_INPUT_TXT_IN_LOG = 1024
 
@@ -26,6 +27,7 @@ def print_metrics(
     whisper_genai=None,
     chat_idx=None,
     prefill_time=None,
+    tts_audio=None,
 ):
     iter_str = str(iter_num)
     if warm_up:
@@ -40,9 +42,16 @@ def print_metrics(
     if iter_data['input_size'] != '':
         output_str += 'Input token size: {}, '.format(iter_data['input_size'])
     if iter_data.get('output_size', '') != '':
-        output_str += 'Output size: {}, '.format(iter_data['output_size'])
-    if iter_data['infer_count'] != '':
-        output_str += 'Infer count: {}, '.format(iter_data['infer_count'])
+        if tts_audio is not None:
+            output_str += "Output size: {} samples ({:.2f}s @ {}Hz), ".format(
+                tts_audio["samples"],
+                tts_audio["duration_s"],
+                tts_audio["sample_rate"],
+            )
+        else:
+            output_str += "Output size: {}, ".format(iter_data["output_size"])
+    if iter_data["infer_count"] != "":
+        output_str += "Infer count: {}, ".format(iter_data["infer_count"])
     if tokenization_time:
         output_str += 'Tokenization Time: {:.2f}ms, '.format(tokenization_time[0])
         if len(tokenization_time) > 1:
@@ -51,6 +60,10 @@ def print_metrics(
         output_str += ' Multimodal Embeddings Preparation Time: {:.2f}ms, '.format(iter_data['mm_embeddings_preparation_time'])
     if iter_data.get('generation_time', '') != '':
         output_str += 'Generation Time: {:.2f}s, '.format(iter_data['generation_time'])
+    if "end_to_end_token_throughput" in iter_data:
+        output_str += "End-to-end token throughput: {:.2f} tokens/s, ".format(iter_data["end_to_end_token_throughput"])
+    if tts_audio is not None:
+        output_str += "RTF: {}, ".format(f"{tts_audio['rtf']:.4f}" if tts_audio["rtf"] >= 0 else "N/A")
     if prefill_time and prefill_time != "":
         output_str += "Prefill Time: {:.2f}ms, ".format(prefill_time)
     if iter_data.get("total_time", "") != "":
@@ -126,6 +139,57 @@ def print_metrics(
         log.info(f"{prefix} Result MD5:{iter_data['result_md5']}")
 
 
+def print_average_tts(iter_data_list, prompt_idx_list):
+    if len(iter_data_list) <= 1:
+        # 1st iteration is the warm-up iteration
+        return
+
+    measured_iterations = {
+        data.get("iteration") for data in iter_data_list if data.get("iteration") not in ("", None, 0)
+    }
+    total_iters = len(measured_iterations)
+    if total_iters <= 0:
+        return
+
+    avg_lines = []
+    for prompt_idx in prompt_idx_list:
+        prompt_iters = [
+            data for data in iter_data_list if data["iteration"] > 0 and data.get("prompt_idx") == prompt_idx
+        ]
+        if len(prompt_iters) == 0:
+            continue
+
+        generation_times = [data["generation_time"] for data in prompt_iters if data.get("generation_time", "") != ""]
+        output_samples = [data["output_size"] for data in prompt_iters if data.get("output_size", "") != ""]
+        output_durations = [
+            data["tts_output_duration_s"] for data in prompt_iters if data.get("tts_output_duration_s", "") != ""
+        ]
+
+        avg_gen_time = sum(generation_times) / len(generation_times) if len(generation_times) > 0 else -1
+        avg_samples = int(sum(output_samples) / len(output_samples)) if len(output_samples) > 0 else -1
+        avg_duration = sum(output_durations) / len(output_durations) if len(output_durations) > 0 else -1
+
+        avg_rtf = -1
+        if avg_gen_time >= 0 and avg_duration > 0:
+            avg_rtf = avg_gen_time / avg_duration
+
+        prefix = f"[Average] P[{prompt_idx}]"
+        gen_time_str = f"{avg_gen_time:.2f}s" if avg_gen_time >= 0 else "NA"
+        output_size_str = f"{avg_samples} samples" if avg_samples >= 0 else "NA"
+        output_duration_str = f"{avg_duration:.2f}s" if avg_duration >= 0 else "NA"
+        rtf_str = f"{avg_rtf:.4f}" if avg_rtf >= 0 else "NA"
+        avg_lines.append(
+            f"{prefix} Generation Time: {gen_time_str}, "
+            f"Output size: {output_size_str} ({output_duration_str}), "
+            f"RTF: {rtf_str}"
+        )
+
+    log.info("<<< Warm-up iteration is excluded. >>>")
+    log.info("[Total] Iterations: {}".format(total_iters))
+    for line in avg_lines:
+        log.info(line)
+
+
 def print_memory_info(
     iter_num,
     iter_data: dict,
@@ -175,11 +239,11 @@ def print_unicode(text, on_error="Unable print", loglevel="info", max_output=sys
         log_fn(output_text)
     except (UnicodeError, UnicodeEncodeError, UnicodeDecodeError):
         try:
-            utf8_text = text.encode(encoding="utf-8", errors="replace").decode()
-            if len(utf8_text) > max_output:
-                output_text = utf8_text[:max_output] + f" ... [truncated to {max_output}]"
+            text = text.encode("ascii", errors="backslashreplace").decode("ascii")
+            if len(text) > max_output:
+                output_text = text[:max_output] + f" ... [truncated to {max_output}]"
             else:
-                output_text = utf8_text
+                output_text = text
             log_fn(output_text)
         except Exception:
             log.warning(on_error)
@@ -271,6 +335,7 @@ def output_avg_statis_tokens(
         avg_input_size = 0
         input_sizes = []
         index_num = 0
+        input_iter_data_list = []
 
         if latency_unit is None:
             latency_unit = 'token' if is_text_gen else 'step'
@@ -295,6 +360,7 @@ def output_avg_statis_tokens(
                 else:
                     avg_input_size += iter_data["input_size"] if iter_data["input_size"] != "" else 0
                 index_num = index_num + 1
+                input_iter_data_list.append(iter_data)
         if index_num > 0:
             avg_1st_token_latency = avg_1st_token_latency / index_num
             avg_2nd_tokens_latency = avg_2nd_tokens_latency / index_num
@@ -352,6 +418,9 @@ def output_avg_statis_tokens(
                         prefix, avg_1st_token_latency, avg_2nd_tokens_latency, avg_2nd_token_tput
                     )
                 )
+            end_to_end_token_throughput = get_end_to_end_token_throughput(input_iter_data_list)
+            if end_to_end_token_throughput is not None:
+                inputs_dict[iter_idx] += f", End-to-end token throughput: {end_to_end_token_throughput:.2f} tokens/s"
 
 
 def print_average(
@@ -396,7 +465,7 @@ def print_average(
 
 
 def print_whisper_infer_latency(iter_str, whisper, prompt_idx=-1):
-    log.debug(f'{whisper.print_whisper_latency(iter_str, prompt_idx)}')
+    log.debug(f"{whisper.print_whisper_latency(iter_str, prompt_idx)}")
 
 
 def print_asr_genai_latency(iter_str, metrics, prompt_idx=-1):

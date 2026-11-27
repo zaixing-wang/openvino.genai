@@ -4,6 +4,7 @@
 #pragma once
 #include <type_traits>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <utility>
 #include <tuple>
@@ -14,6 +15,7 @@
 #include "openvino/genai/llm_pipeline.hpp"
 #include "openvino/genai/visual_language/pipeline.hpp"
 #include "openvino/genai/rag/text_embedding_pipeline.hpp"
+#include "openvino/genai/rag/text_rerank_pipeline.hpp"
 #include "openvino/runtime/core.hpp"
 
 #include "openvino/genai/generation_handle.hpp"
@@ -21,12 +23,16 @@
 #include "openvino/genai/generation_config.hpp"
 
 #include "openvino/genai/streamer_base.hpp"
+#include "openvino/genai/visibility.hpp"
 
 namespace ov {
 namespace genai {
 
 extern const std::string PA_BACKEND;
 extern const std::string SDPA_BACKEND;
+
+/// @brief Registers a stateless transform applied to the tokenizer's current and all future chat templates.
+void set_chat_template_patcher(Tokenizer& tokenizer, std::function<std::string(const std::string&)> patcher);
 
 }  // namespace genai
 }  // namespace ov
@@ -55,6 +61,8 @@ struct GenerationFinishInfo
 {
     EncodedResults results;
     GenerationStatus streaming_finish_status;
+    // Speech decoded in the language model stream (LFM3-Omni), [1, 1, samples]; empty otherwise.
+    ov::Tensor speech_waveform;
 };
 
 // A request finishes with GenerationStatus::IGNORED when the scheduler could not fit it within
@@ -80,6 +88,9 @@ template <typename T> struct OmitOptional<std::optional<T>> { using value = T; }
 template <typename T> constexpr bool is_optional = false;
 template <typename T> constexpr bool is_optional<std::optional<T>> = true;
 
+template <typename T> constexpr bool is_set = false;
+template <typename T> constexpr bool is_set<std::set<T>> = true;
+
 template <typename T>
 void read_anymap_param(const ov::AnyMap& config_map, const std::string& name, T& param) {
     auto it = config_map.find(name);
@@ -91,6 +102,26 @@ void read_anymap_param(const ov::AnyMap& config_map, const std::string& name, T&
                 OPENVINO_THROW("Got empty ov::Any for parameter name: " + name);
             }
         }
+        else if constexpr (is_set<T>) {
+            // A set-valued property arrives from Python as std::vector for a list and as std::string for a str.
+            // ov::Any can't convert a std::vector to a std::set, and it converts a std::string by splitting it on
+            // whitespace, so "Observation: done" would become two stop strings. Read both forms explicitly.
+            using Value = typename T::value_type;
+            if (it->second.is<std::vector<Value>>()) {
+                const auto& values = it->second.as<std::vector<Value>>();
+                param = T(values.begin(), values.end());
+                return;
+            }
+            if constexpr (std::is_same_v<Value, std::string>) {
+                if (it->second.is<std::string>()) {
+                    // an empty string is an empty set, as ov::Any parsed it before
+                    const auto& value = it->second.as<std::string>();
+                    param = value.empty() ? T{} : T{value};
+                    return;
+                }
+            }
+            param = it->second.as<T>();
+        }
         else {
             param = it->second.as<typename OmitOptional<T>::value>();
         }
@@ -98,7 +129,7 @@ void read_anymap_param(const ov::AnyMap& config_map, const std::string& name, T&
 }
 
 const std::string STREAMER_ARG_NAME = "streamer";
-const std::string AUDIO_STREAMER_ARG_NAME = "audio_streamer";
+const std::string SPEECH_STREAMER_ARG_NAME = "speech_streamer";
 const std::string CONFIG_ARG_NAME = "generation_config";
 const std::string DRAFT_MODEL_ARG_NAME = "draft_model";
 const std::string EXTENSIONS_ARG_NAME = "extensions";
@@ -113,15 +144,19 @@ Config from_config_json_if_exists(const std::filesystem::path& models_path, cons
     return std::filesystem::exists(config_file_path) ? Config{config_file_path} : Config{};
 }
 
-ov::genai::StreamerVariant get_streamer_from_map(const ov::AnyMap& config_map);
-ov::genai::OmniSpeechStreamerVariant get_audio_streamer_from_map(const ov::AnyMap& config_map);
+OPENVINO_GENAI_EXPORTS ov::genai::StreamerVariant get_streamer_from_map(const ov::AnyMap& config_map);
+ov::genai::OmniSpeechStreamerVariant get_speech_streamer_from_map(const ov::AnyMap& config_map);
 
-ov::genai::OptionalGenerationConfig get_config_from_map(const ov::AnyMap& config_map);
+OPENVINO_GENAI_EXPORTS ov::genai::OptionalGenerationConfig get_config_from_map(const ov::AnyMap& config_map);
 
 bool is_npu_requested(const std::string& device, const ov::AnyMap& properties);
 
 // Sets a key/value pair in config only if the key is not already present.
 void set_config_default(ov::AnyMap& config, const std::string& key, ov::Any value);
+
+// Returns the value of a YES/NO (or bool) property, false when it is absent.
+// Any other value throws an error that names the property.
+bool is_property_enabled(const ov::AnyMap& config, const std::string& name);
 
 // Returns true when NPUW is enabled via NPU_USE_NPUW.
 bool is_npuw_enabled(const ov::AnyMap& config);
@@ -142,9 +177,14 @@ std::pair<ov::AnyMap, bool> extract_gguf_properties(const ov::AnyMap& external_p
 /// Value shape: ov::AnyMap keyed by model role (e.g. "vision_embeddings").
 extern const std::string PER_MODEL_PROPERTIES;
 
+/// @brief Key under which a pipeline forwards the adapters it already consumed to its sub-model constructors.
+/// Value shape: AdapterConfig. GenAI-internal: absent from the public API, so a user-supplied `adapters` entry
+/// is never mistaken for it and still reaches the plugin.
+extern const std::string FORWARDED_ADAPTERS_PROPERTY;
+
 /// @brief Resolve properties for @p model_role by merging three layers (priority low to high):
-///        1. global (top-level keys, excluding meta keys PER_MODEL_PROPERTIES
-///           and DEVICE_PROPERTIES if device is specified)
+///        1. global (top-level keys, excluding meta keys PER_MODEL_PROPERTIES,
+///           FORWARDED_ADAPTERS_PROPERTY and DEVICE_PROPERTIES if device is specified)
 ///        2. DEVICE_PROPERTIES[device] (only when @p device is non-empty)
 ///        3. PER_MODEL_PROPERTIES[model_role]
 ///        MODEL_PROPERTIES wins over DEVICE_PROPERTIES wins
@@ -260,6 +300,15 @@ std::pair<ov::CompiledModel, KVDesc> compile_decoder_for_npu_text_embedding(cons
                                                                             const ov::AnyMap& config,
                                                                             const KVAxesPosition& kv_pos,
                                                                             const ov::genai::TextEmbeddingPipeline::Config& text_embed_config);
+
+std::pair<ov::CompiledModel, KVDesc> compile_decoder_for_npu_text_rerank(const std::shared_ptr<ov::Model>& model,
+                                                                         const ov::AnyMap& config,
+                                                                         const KVAxesPosition& kv_pos,
+                                                                         const ov::genai::TextRerankPipeline::Config& text_rerank_config);
+
+ov::CompiledModel compile_kokoro_for_npu_speech_generation(const std::filesystem::path& model_path,
+                                                           const ov::AnyMap& properties,
+                                                           size_t static_input_ids_length);
 
 size_t get_npu_kv_cache_capacity(const ov::CompiledModel& compiled_model);
 
@@ -392,6 +441,12 @@ void extract_extensions_to_core(ov::AnyMap& properties);
 
 void clear_false_prompt_lookup_from_config(ov::AnyMap& properties);
 
+void log_attention_backend(const std::string& attention_backend);
+
+// Print an INFO message about the Paged Attention initialization failure and the SDPA fallback,
+// followed by a DEBUG message with the original exception details.
+void log_paged_attention_fallback(const ov::Exception& exception);
+
 void save_openvino_model(const std::shared_ptr<ov::Model>& model, const std::string& save_path, bool compress_to_fp16);
 
 ov::Tensor merge_text_and_image_embeddings_llava(const ov::Tensor& input_ids, ov::Tensor& text_embeds, const std::vector<ov::Tensor>& image_embeds, int64_t image_token_id);
@@ -451,10 +506,14 @@ ov::genai::GenerationConfig get_greedy_config();
 ov::genai::GenerationConfig get_multinomial_config();
 
 /**
- * @brief Patches the chat template in the provided Tokenizer and
- * removes any implicit concatenation of adjacent multiline string literals.
+ * @brief Removes implicit concatenation of adjacent multiline string literals from a chat template.
  */
-void patch_chat_template_multiline_strings(Tokenizer& tokenizer);
+std::string patch_chat_template_multiline_strings(const std::string& chat_template);
+
+/**
+ * @brief Rewrites "var is undefined" tests, which minja does not support, to the equivalent "not var is defined".
+ */
+std::string patch_chat_template_undefined_tests(const std::string& chat_template);
 
 }  // namespace utils
 }  // namespace genai

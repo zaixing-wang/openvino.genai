@@ -6,16 +6,21 @@
 #include <vector>
 #include <cassert>
 #include <chrono>
+#include <functional>
+#include <limits>
 #include <set>
 #include <cstdlib>
 #include <string_view>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 
 #include "openvino/genai/generation_handle.hpp"
 #include "openvino/genai/generation_config.hpp"
+#include "content_hash.hpp"
 #include "generation_stream.hpp"
 #include "logger.hpp"
+#include "sampling/draft_proposal.hpp"
 
 namespace ov::genai {
 enum class SequenceStatus {
@@ -58,10 +63,12 @@ class Sequence {
 
     TokenIds m_generated_ids;
     LogProbs m_generated_log_probs;
+    // Empty until a proposal is recorded, then aligned with m_generated_ids.
+    std::vector<DraftProposalPtr> m_draft_proposals;
     uint64_t m_grouped_id;
     uint64_t m_id = _get_next_global_sequence_id();
     ov::Tensor m_hidden_state = ov::Tensor();
-    // When enabled, one intermediate hidden state is accumulated per generated token
+    // When enabled, one intermediate hidden state is kept per token position
     // (prefill batches are sliced into per-token tensors before accumulation)
     static constexpr size_t kMaxAccumulatedHiddenStates = 512;
     bool m_accumulate_hidden_states = false;
@@ -70,7 +77,11 @@ class Sequence {
     SequenceStatus m_status = SequenceStatus::RUNNING;
     GenerationFinishReason m_finish_reason = GenerationFinishReason::NONE;
     float m_cumulative_log_prob = 0.0f;
-    std::vector<int64_t> m_prefix_hashes;
+    std::unordered_map<size_t, std::vector<int64_t>> m_prefix_hashes;
+    // Digest chain parallel to m_prefix_hashes, filled only while a digest-keyed consumer asks for it.
+    std::unordered_map<size_t, std::vector<ContentHash>> m_prefix_digests;
+    size_t m_prefix_publication_limit = std::numeric_limits<size_t>::max();
+    std::function<size_t(size_t, size_t)> m_prefix_hash_provider;
     SequenceGroup* m_sequence_group = nullptr;
     static std::mutex m_counter_mutex;
     std::vector<std::vector<float>> m_generated_ids_embeds;
@@ -85,14 +96,22 @@ class Sequence {
     static constexpr size_t m_embeddings_hash_calculation_stride = 50; // the stride with which values are taken from embeddings vector
 
     size_t _make_hash(size_t content_length, size_t block_size);
+    ContentHash _make_digest(size_t content_length, size_t block_size);
+    void record_digest(size_t hash, size_t content_length, size_t block_size);
+    /// @param exact_embeddings Whether an embedding enters the content with all its values (the digest, which a store
+    /// that outlives the process keys blocks by) or with a few sampled ones (the in-process hash).
+    void _append_block_content(std::vector<int64_t>& content, size_t block_start_idx, size_t content_length, bool exact_embeddings);
+    void truncate_prefix_hashes();
 
     static std::vector<int64_t> _reduce_embedding(const std::vector<float>& embedding);
+    static std::vector<int64_t> _exact_embedding(const std::vector<float>& embedding);
 
     explicit Sequence(const uint64_t id, const SequenceGroupType type, const size_t hidden_size) : m_grouped_id(id), m_type(type), m_hidden_size(hidden_size) {}
 
     Sequence(const Sequence& seq, const uint64_t id) :
         m_generated_ids(seq.m_generated_ids),
         m_generated_log_probs(seq.m_generated_log_probs),
+        m_draft_proposals(seq.m_draft_proposals),
         m_grouped_id(id),
         m_hidden_state(seq.m_hidden_state),
         m_accumulate_hidden_states(seq.m_accumulate_hidden_states),
@@ -100,11 +119,14 @@ class Sequence {
         m_all_intermediate_hidden_states(seq.m_all_intermediate_hidden_states),
         m_status(seq.m_status),
         m_cumulative_log_prob(seq.m_cumulative_log_prob),
+        m_prefix_hashes(seq.m_prefix_hashes),
+        m_prefix_digests(seq.m_prefix_digests),
+        m_prefix_publication_limit(seq.m_prefix_publication_limit),
+        m_prefix_hash_provider(seq.m_prefix_hash_provider),
         m_sequence_group(seq.m_sequence_group),
+        m_generated_ids_embeds(seq.m_generated_ids_embeds),
         m_type(seq.m_type),
         m_hidden_size(seq.m_hidden_size),
-        m_prefix_hashes(seq.m_prefix_hashes),
-        m_generated_ids_embeds(seq.m_generated_ids_embeds),
         m_position_ids_list(seq.m_position_ids_list),
         m_rope_delta(seq.m_rope_delta),
         m_tree_metadata(seq.m_tree_metadata)
@@ -168,6 +190,9 @@ public:
         m_cumulative_log_prob += log_prob;
         m_generated_log_probs.push_back(log_prob);
         m_generated_ids.push_back(token_id);
+        if (!m_draft_proposals.empty()) {
+            m_draft_proposals.emplace_back();
+        }
     }
 
     void update_hidden_state(const ov::Tensor& tensor) {
@@ -186,20 +211,41 @@ public:
         return m_tree_metadata;
     }
 
-    void update_intermediate_hidden_state(const ov::Tensor& tensor) {
-        if (m_accumulate_hidden_states && tensor.get_size() > 0) {
-            if (m_all_intermediate_hidden_states.size() >= kMaxAccumulatedHiddenStates) {
-                if (!m_hidden_state_cap_warned) {
-                    GENAI_WARN("Hidden state accumulation cap reached (%zu tokens); stopping accumulation",
-                               kMaxAccumulatedHiddenStates);
-                    m_hidden_state_cap_warned = true;
-                }
-                return;
-            }
-            ov::Tensor copy(tensor.get_element_type(), tensor.get_shape());
-            tensor.copy_to(copy);
-            m_all_intermediate_hidden_states.push_back(std::move(copy));
+    // A position computed again after preemption replaces its earlier state, so the vector stays
+    // indexed by absolute token position.
+    void set_intermediate_hidden_state(size_t position, const ov::Tensor& tensor) {
+        if (!m_accumulate_hidden_states || tensor.get_size() == 0) {
+            return;
         }
+        if (position >= kMaxAccumulatedHiddenStates && !m_hidden_state_cap_warned) {
+            GENAI_WARN("Hidden state accumulation cap reached (%zu tokens); stopping accumulation",
+                       kMaxAccumulatedHiddenStates);
+            m_hidden_state_cap_warned = true;
+            return;
+        }
+        // Preemption can compute a position past the cap again after the warning was logged.
+        // A prefix restored without prefill_intermediate_hidden_states() belongs to a request that did
+        // not ask for hidden states; its later hidden states cannot be indexed, so they are dropped.
+        if (position >= kMaxAccumulatedHiddenStates || position > m_all_intermediate_hidden_states.size()) {
+            return;
+        }
+        ov::Tensor copy(tensor.get_element_type(), tensor.get_shape());
+        tensor.copy_to(copy);
+        if (position == m_all_intermediate_hidden_states.size()) {
+            m_all_intermediate_hidden_states.push_back(std::move(copy));
+        } else {
+            m_all_intermediate_hidden_states[position] = std::move(copy);
+        }
+    }
+
+    /// @param hidden_states Hidden states restored from the prefix cache, for positions [0, hidden_states.size()).
+    void prefill_intermediate_hidden_states(std::vector<ov::Tensor> hidden_states) {
+        OPENVINO_ASSERT(m_all_intermediate_hidden_states.empty(),
+                        "Restored hidden states must precede every computed one");
+        if (hidden_states.size() > kMaxAccumulatedHiddenStates) {
+            hidden_states.resize(kMaxAccumulatedHiddenStates);
+        }
+        m_all_intermediate_hidden_states = std::move(hidden_states);
     }
 
     void set_accumulate_hidden_states(bool enable) {
@@ -223,6 +269,9 @@ public:
             m_cumulative_log_prob -= m_generated_log_probs.back();
             m_generated_log_probs.pop_back();
             m_generated_ids.pop_back();
+            if (!m_draft_proposals.empty()) {
+                m_draft_proposals.pop_back();
+            }
         }
         if (m_type == SequenceGroupType::EMBEDDINGS) {
             const size_t tokens_to_remove = static_cast<size_t>(n);
@@ -234,6 +283,7 @@ public:
             truncate_generated_ids_embeds(embeds_to_remove);
             truncate_position_ids(position_ids_to_remove);
         }
+        truncate_prefix_hashes();
     }
 
     GenerationOutput get_last_generation_output(size_t token_cnt = 1, size_t num_token_to_ignore = 0) {
@@ -279,7 +329,46 @@ public:
 
     void update_generated_log_prob(size_t idx, float log_prob) {
         OPENVINO_ASSERT(idx < m_generated_log_probs.size());
+        m_cumulative_log_prob += log_prob - m_generated_log_probs[idx];
         m_generated_log_probs[idx] = log_prob;
+    }
+
+    void set_draft_proposal(size_t idx, DraftProposalPtr proposal) {
+        if (m_draft_proposals.empty()) {
+            m_draft_proposals.resize(m_generated_ids.size());
+        }
+        OPENVINO_ASSERT(idx < m_draft_proposals.size());
+        m_draft_proposals[idx] = std::move(proposal);
+    }
+
+    void set_draft_proposal(size_t idx, DraftProposal proposal) {
+        set_draft_proposal(idx, std::make_shared<const DraftProposal>(std::move(proposal)));
+    }
+
+    const DraftProposal& get_draft_proposal(size_t idx) const {
+        static const DraftProposal empty_proposal;
+        if (m_draft_proposals.empty()) {
+            return empty_proposal;
+        }
+        OPENVINO_ASSERT(idx < m_draft_proposals.size());
+        const auto& proposal = m_draft_proposals[idx];
+        return proposal ? *proposal : empty_proposal;
+    }
+
+    const std::vector<DraftProposalPtr>& get_draft_proposals() const {
+        return m_draft_proposals;
+    }
+
+    void clear_draft_proposal(size_t idx) {
+        if (m_draft_proposals.empty()) {
+            return;
+        }
+        OPENVINO_ASSERT(idx < m_draft_proposals.size());
+        m_draft_proposals[idx].reset();
+    }
+
+    void clear_draft_proposals() {
+        m_draft_proposals.clear();
     }
 
     float get_beam_search_score(const ov::genai::GenerationConfig& sampling_params) const {
@@ -316,8 +405,9 @@ public:
         OPENVINO_ASSERT(m_type == SequenceGroupType::EMBEDDINGS);
         OPENVINO_ASSERT(num_tokens <= m_generated_ids_embeds.size());
         // remove the last num_tokens embeddings
-        if (num_tokens > 0)
+        if (num_tokens > 0) {
             m_generated_ids_embeds.resize(m_generated_ids_embeds.size() - num_tokens);
+        }
     }
 
     void truncate_position_ids(size_t num_tokens) {
@@ -371,7 +461,26 @@ public:
     size_t get_hash(size_t content_length, size_t block_size);
     size_t get_hash(size_t block_size);
 
-    static std::pair<ov::Coordinate, ov::Coordinate> get_position_ids_elem_coordinates(const ov::Shape& position_ids_elem_shape, size_t idx, bool need_batch_dimention) {
+    /// @return The 128-bit digest of the same prefix get_hash() identifies, a reproducible function of the prefix
+    /// content alone. It is independent of the size_t hash, which std::hash makes implementation-defined.
+    ContentHash get_digest(size_t content_length, size_t block_size);
+
+    /// @return Number of leading positions get_hash() can identify. A stop-string trim can make it smaller
+    /// than the number of processed tokens.
+    size_t get_prefix_identity_length() const;
+
+    void set_prefix_cache_policy(size_t publication_limit,
+                                 std::function<size_t(size_t, size_t)> hash_provider = {}) {
+        OPENVINO_ASSERT(m_prefix_hashes.empty(), "Prefix cache policy must be set before hashing");
+        m_prefix_publication_limit = publication_limit;
+        m_prefix_hash_provider = std::move(hash_provider);
+    }
+
+    size_t get_prefix_publication_limit() const {
+        return m_prefix_publication_limit;
+    }
+
+    static std::pair<ov::Coordinate, ov::Coordinate> get_position_ids_elem_coordinates(const ov::Shape& position_ids_elem_shape, size_t idx, bool need_batch_dimension) {
 
         ov::Coordinate begin;
         ov::Coordinate end;
@@ -380,7 +489,7 @@ public:
             end = ov::Coordinate{position_ids_elem_shape[0], 1, idx + 1};
         }
         else if (position_ids_elem_shape.size() == 2) {
-            if (need_batch_dimention) {
+            if (need_batch_dimension) {
                 begin = ov::Coordinate{0, idx};
                 end = ov::Coordinate{1, idx + 1};
             }
@@ -413,6 +522,9 @@ class SequenceGroup  : public std::enable_shared_from_this<SequenceGroup> {
     
     ov::Tensor m_per_layer_inputs;
 
+    ov::Tensor m_ngram_embeddings;
+    ov::Tensor m_ngram_history;
+
     std::vector<float> m_prompt_log_probs;
     GenerationStream::Ptr m_generation_stream;
     size_t m_num_evicted_tokens = 0;
@@ -424,7 +536,7 @@ class SequenceGroup  : public std::enable_shared_from_this<SequenceGroup> {
     // amount of processed tokens, e.g. prompt can be processed using multiple consequence inferences
     // so, we need to track which part of the prompt we have already processed
     size_t m_num_processed_tokens = 0;
-    // a number of scheduled tokens by Scheduler::schedule logic
+    // a number of scheduled tokens by ContinuousBatchingScheduler::schedule logic
     size_t m_num_scheduled_tokens = 0;
     // context length of longest sequence within a group
     size_t m_max_content_len = 0;
@@ -437,6 +549,7 @@ class SequenceGroup  : public std::enable_shared_from_this<SequenceGroup> {
     size_t m_output_seq_len = 0;
 
     size_t m_num_streamed_tokens = 0, m_stream_window_size = 0;
+    bool m_terminal_notification_sent = false;
     TimePoint m_start_time = std::chrono::steady_clock::now();
     PerfMetrics m_perf_metrics;
 
@@ -455,19 +568,22 @@ class SequenceGroup  : public std::enable_shared_from_this<SequenceGroup> {
         return false;
     }
 
+    void stream_output() {
+        deliver_notification(prepare_notification());
+    }
+
 public:
     using Ptr = std::shared_ptr<SequenceGroup>;
     using CPtr = std::shared_ptr<const SequenceGroup>;
 
     // const_cast is safe as ov::Tensor only views the data and doesn't modify it.
     SequenceGroup(uint64_t request_id, const TokenIds& input_ids, const ov::genai::GenerationConfig& sampling_params)
-        : SequenceGroup(request_id, ov::Tensor(ov::element::i64, ov::Shape{input_ids.size()}, const_cast<int64_t*>(input_ids.data())), sampling_params, std::nullopt, std::nullopt) {
+        : SequenceGroup(request_id, ov::Tensor(ov::element::i64, ov::Shape{input_ids.size()}, const_cast<int64_t*>(input_ids.data())), sampling_params, std::nullopt) {
     }
 
     SequenceGroup(uint64_t request_id,
                   const ov::Tensor& input_ids,
                   const ov::genai::GenerationConfig& sampling_params,
-                  const std::optional<ov::Tensor>& token_type_ids = std::nullopt,
                   const std::optional<std::unordered_map<std::string, ov::Tensor>>& lm_extra_inputs = std::nullopt,
                   const std::optional<ov::Tensor>& position_ids = std::nullopt,
                   const std::optional<int64_t>& rope_delta = std::nullopt,
@@ -493,11 +609,6 @@ public:
                 m_input_embeds[i].resize(hidden_size);
                 std::copy_n(input_ids.data<const float>() + i * hidden_size, hidden_size, m_input_embeds[i].begin());
             }
-            if (token_type_ids.has_value()) {
-                const ov::Tensor& tokens = token_type_ids.value();
-                m_token_type_ids = std::vector<int64_t>(tokens.get_size());
-                std::copy_n(tokens.data<const int64_t>(), tokens.get_size(), m_token_type_ids->begin());
-            }
             if (prompt_ids.has_value()) {
                 const ov::Tensor& tokens = prompt_ids.value();
                 OPENVINO_ASSERT(tokens.get_element_type() == ov::element::i64);
@@ -519,6 +630,21 @@ public:
                             "per_layer_inputs must have shape [1, tokens, num_hidden_layers, hidden_size]");
                         m_per_layer_inputs = ov::Tensor(tensor.get_element_type(), shape);
                         tensor.copy_to(m_per_layer_inputs);
+                    } else if (input_name == "token_type_ids") {
+                        m_token_type_ids = std::vector<int64_t>(
+                            tensor.data<const int64_t>(),
+                            tensor.data<const int64_t>() + tensor.get_size()
+                        );
+                    } else if (input_name == "ngram_embeddings") {
+                        OPENVINO_ASSERT(tensor.get_element_type() == ov::element::f32, "ngram_embeddings must have element type f32");
+                        const auto& shape = tensor.get_shape();
+                        OPENVINO_ASSERT(shape.size() == 4 && shape[0] == 1 && shape[1] == prompt_len,
+                            "ngram_embeddings must have shape [1, tokens, num_ple_layers, ple_embed_dim], got ", shape);
+                        m_ngram_embeddings = ov::Tensor(tensor.get_element_type(), shape);
+                        tensor.copy_to(m_ngram_embeddings);
+                    } else if (input_name == "ngram_history") {
+                        m_ngram_history = ov::Tensor(tensor.get_element_type(), tensor.get_shape());
+                        tensor.copy_to(m_ngram_history);
                     } else {
                         OPENVINO_THROW("Unsupported extra input for LLM: " + input_name);
                     }
@@ -779,6 +905,11 @@ public:
         m_stream_window_size = k;
     }
 
+    /// @brief Number of generated tokens prepare_notification() has released to the generation stream.
+    size_t get_num_streamed_tokens() const {
+        return m_num_streamed_tokens;
+    }
+
     size_t get_num_available_tokens_for_batching() const {
         OPENVINO_ASSERT(!has_finished(), "Internal error: this function cannot be called on finished sequence group");
         OPENVINO_ASSERT(get_num_scheduled_tokens() == 0, "Internal error: this function cannot be called when we are already in scheduling phase");
@@ -836,6 +967,16 @@ public:
     const ov::Tensor& get_per_layer_inputs() const {
         OPENVINO_ASSERT(m_sequence_group_type == ov::genai::SequenceGroupType::EMBEDDINGS);
         return m_per_layer_inputs;
+    }
+
+    const ov::Tensor& get_ngram_embeddings() const {
+        OPENVINO_ASSERT(m_sequence_group_type == ov::genai::SequenceGroupType::EMBEDDINGS);
+        return m_ngram_embeddings;
+    }
+
+    const ov::Tensor& get_ngram_history() const {
+        OPENVINO_ASSERT(m_sequence_group_type == ov::genai::SequenceGroupType::EMBEDDINGS);
+        return m_ngram_history;
     }
 
     size_t get_hidden_size() const {
@@ -911,6 +1052,14 @@ public:
         m_generation_stream->set_generation_status(status);
     }
 
+    void set_num_prefix_cache_hit_tokens(size_t num_prefix_cache_hit_tokens) {
+        m_perf_metrics.num_prefix_cache_hit_tokens = num_prefix_cache_hit_tokens;
+    }
+
+    size_t get_num_prefix_cache_hit_tokens() const {
+        return m_perf_metrics.num_prefix_cache_hit_tokens;
+    }
+
     void update_perf_metrics(MicroSeconds inference_duration,
                              MicroSeconds sampling_duration,
                              size_t batch_size,
@@ -960,7 +1109,17 @@ public:
         m_generation_stream->push({});
     }
 
-    void push_finished_hidden_states() {
+    void fail_generation(std::exception_ptr error) {
+        m_generation_stream->fail(std::move(error));
+    }
+
+    struct PendingNotification {
+        GenerationOutputs outputs;
+        GenerationStatus status = GenerationStatus::RUNNING;
+        bool publish = false;
+    };
+
+    GenerationOutputs get_finished_hidden_states() {
         GenerationOutputs outputs;
         for (auto& sequence : m_sequences) {
             if (!sequence->has_finished()) {
@@ -976,10 +1135,10 @@ public:
             output.intermediate_hidden_states = hidden_states;
             outputs.emplace(sequence->get_grouped_id(), output);
         }
-        m_generation_stream->push(std::move(outputs));
+        return outputs;
     }
 
-    void push_outputs() {
+    GenerationOutputs get_outputs() {
         GenerationOutputs outputs;
         for (auto& sequence: m_sequences) {
             GenerationOutput output;
@@ -994,10 +1153,10 @@ public:
             output.intermediate_hidden_states = sequence->get_all_intermediate_hidden_states();
             outputs.emplace(sequence->get_grouped_id(), output);
         }
-        m_generation_stream->push(std::move(outputs));
+        return outputs;
     }
 
-    void push_partial_outputs(size_t token_cnt = 1) {
+    GenerationOutputs get_partial_outputs(size_t token_cnt = 1) {
         GenerationOutputs outputs;
         for (auto& sequence : m_sequences) {
             // todo: check seq.is_finished() to generate without several </s>
@@ -1014,36 +1173,81 @@ public:
             outputs.emplace(sequence->get_grouped_id(), output);
         }
         m_has_echoed = true;
-        m_generation_stream->push(std::move(outputs));
+        return outputs;
     }
 
+    // Convenience dispatcher for callers that don't know the terminal state in advance (e.g. non-CB pipelines).
     void notify_handle() {
+        if (out_of_memory())
+            notify_handle_oom();
+        else if (has_finished())
+            notify_handle_final();
+        else
+            stream_output();
+    }
+
+    // True once a terminal notification (final push + unblocking terminator) has reached the handle,
+    // however it was triggered (finished / OOM / echo-only / externally stopped / cancelled).
+    bool notified_terminal() const {
+        return m_terminal_notification_sent;
+    }
+
+    void notify_handle_oom() {
+        if (m_terminal_notification_sent)
+            return;
+        stream_output();
+    }
+
+    // Push the final output for a finished group; must be called after set_perf_metrics() to close the metrics race.
+    void notify_handle_final() {
+        if (m_terminal_notification_sent)
+            return;
+        OPENVINO_ASSERT(has_finished());
+        stream_output();
+    }
+
+    // Unblocks a reader stuck in read()/read_all() for a request stopped/cancelled by the user
+    // outside of the sampling loop (no new tokens are produced for this transition).
+    void notify_handle_stopped_or_cancelled() {
+        if (m_terminal_notification_sent)
+            return;
+        m_terminal_notification_sent = true;
+        push_empty_outputs();
+    }
+
+    PendingNotification prepare_notification() {
+        PendingNotification notification;
+        GenerationStatus terminal_status = GenerationStatus::RUNNING;
         if (out_of_memory()) {
-            set_generation_status(GenerationStatus::IGNORED);
+            terminal_status = GenerationStatus::IGNORED;
         } else if (has_finished()) {
-            set_generation_status(GenerationStatus::FINISHED);
+            terminal_status = GenerationStatus::FINISHED;
         }
         // For beam search streaming is not available, so we notify only upon finishing
         if (m_sampling_params.is_beam_search()) {
-            if (has_finished()) {
-                push_outputs();
+            if (terminal_status != GenerationStatus::RUNNING) {
+                notification.outputs = get_outputs();
+                notification.status = terminal_status;
+                notification.publish = true;
             }
         } else if (m_sampling_params.is_greedy_decoding() || m_sampling_params.is_multinomial() || m_sampling_params.is_tree_search()) {
             // We can stream only when one sequence is returned and we don't use stop strings that would be excluded from the output
             // (after stop string is detected its tokens are already sent)
             if (num_total_seqs() == 1) {
                 const auto generated_len = m_sequences.front()->get_generated_len();
-                if (has_finished()) {
+                if (terminal_status != GenerationStatus::RUNNING) {
                     m_stream_window_size = 0;
                 }
                 // push empty output in case we won't stream generation res
                 if (generated_len <= (m_num_streamed_tokens + m_stream_window_size)) {
-                    if (has_finished()) {
+                    if (terminal_status != GenerationStatus::RUNNING) {
                         // All tokens already streamed; still deliver accumulated hidden states
                         // (falls back to an empty terminator push when there are none).
-                        push_finished_hidden_states();
+                        notification.outputs = get_finished_hidden_states();
+                        notification.status = terminal_status;
+                        notification.publish = true;
                     }
-                    return;
+                    return notification;
                 }
                 // speculative decoding draft handling
                 if (generated_len < m_num_streamed_tokens) {
@@ -1051,22 +1255,51 @@ public:
                 }
                 OPENVINO_ASSERT(generated_len >= (m_num_streamed_tokens + m_stream_window_size));
                 size_t num_output_token_to_push = generated_len - m_num_streamed_tokens - m_stream_window_size;
-                push_partial_outputs(num_output_token_to_push);
+                notification.outputs = get_partial_outputs(num_output_token_to_push);
+                notification.status = terminal_status;
+                notification.publish = true;
                 m_num_streamed_tokens += (num_output_token_to_push);
-            } else if (has_finished()) {
-                push_outputs();
+            } else if (terminal_status != GenerationStatus::RUNNING) {
+                notification.outputs = get_outputs();
+                notification.status = terminal_status;
+                notification.publish = true;
             }
+        }
+        return notification;
+    }
+
+    void deliver_notification(PendingNotification notification) {
+        if (!notification.publish) {
+            return;
+        }
+        if (m_terminal_notification_sent) {
+            return;
+        }
+        if (notification.status == GenerationStatus::RUNNING) {
+            m_generation_stream->push(std::move(notification.outputs));
+        } else {
+            m_generation_stream->push_and_close(std::move(notification.outputs), notification.status);
+            m_terminal_notification_sent = true;
         }
     }
 
-
     // Special notification path for max_new_tokens == 0 where we don't expect to return any new tokens, but only process prompt
     void notify_handle_echo_only() {
-        // This method is called after scheduling and before sampling,
-        // so m_num_processed_tokens does not include recently forwarded tokens hence this is our starting position
-        // we return m_num_scheduled_tokens tokens as they were forwarded in the current step, meaning context length is our last position.
-        size_t first_token_position = m_num_processed_tokens;
-        size_t last_token_position = get_context_len();
+        if (m_terminal_notification_sent)
+            return;
+        const size_t last_token_position = m_num_processed_tokens;
+        if (last_token_position > m_num_streamed_tokens)
+            notify_handle_echo_only(m_num_streamed_tokens, last_token_position);
+    }
+
+    void notify_handle_echo_only(size_t first_token_position, size_t last_token_position) {
+        deliver_notification(prepare_echo_only_notification(first_token_position, last_token_position));
+        m_num_streamed_tokens = last_token_position;
+    }
+
+    PendingNotification prepare_echo_only_notification(size_t first_token_position, size_t last_token_position) {
+        OPENVINO_ASSERT(first_token_position <= last_token_position);
+        OPENVINO_ASSERT(last_token_position <= get_prompt_len());
 
         GenerationOutput output;
         output.generated_ids = std::vector<int64_t>(m_prompt_ids.begin() + first_token_position, m_prompt_ids.begin() + last_token_position);
@@ -1076,12 +1309,14 @@ public:
 
         if (last_token_position == get_prompt_len()) {
             output.finish_reason = GenerationFinishReason::LENGTH;
-            set_generation_status(GenerationStatus::FINISHED);
             m_sequences[0]->set_status(SequenceStatus::FINISHED); // for cleanup
         }
-        GenerationOutputs outputs;
-        outputs.emplace(0, output);
-        m_generation_stream->push(std::move(outputs));
+        PendingNotification notification;
+        notification.outputs.emplace(0, std::move(output));
+        notification.status = last_token_position == get_prompt_len() ? GenerationStatus::FINISHED
+                                                                       : GenerationStatus::RUNNING;
+        notification.publish = true;
+        return notification;
     }
 
     size_t get_max_new_tokens() const {

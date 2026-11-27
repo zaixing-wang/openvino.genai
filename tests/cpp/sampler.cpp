@@ -2,12 +2,320 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <numeric>
+#include <optional>
+#include <stdexcept>
+#include <vector>
 #include "sampling/sampler.hpp"
 #include "openvino/genai/generation_config.hpp"
 #include "utils.hpp"
 
 
 using namespace ov::genai;
+
+namespace {
+
+using namespace std::chrono_literals;
+
+class WorkerGate {
+public:
+    WorkerGate() : m_release_future(m_release_promise.get_future().share()) {}
+
+    ~WorkerGate() {
+        release();
+    }
+
+    std::shared_future<void> get_release_future() const {
+        return m_release_future;
+    }
+
+    void release() {
+        if (!m_released.exchange(true)) {
+            m_release_promise.set_value();
+        }
+    }
+
+private:
+    std::promise<void> m_release_promise;
+    std::shared_future<void> m_release_future;
+    std::atomic<bool> m_released{false};
+};
+
+class WorkerGateReleaseGuard {
+public:
+    explicit WorkerGateReleaseGuard(WorkerGate& worker_gate) : m_worker_gate(worker_gate) {}
+
+    ~WorkerGateReleaseGuard() {
+        m_worker_gate.release();
+    }
+
+private:
+    WorkerGate& m_worker_gate;
+};
+
+class BlockingLogitTransformer : public LogitTransformers::ILogitTransformer {
+public:
+    BlockingLogitTransformer(std::promise<void>& entered_promise, std::shared_future<void> release_future) :
+        m_entered_promise(entered_promise),
+        m_release_future(std::move(release_future)) {}
+
+    void apply(Logits&) override {
+        m_entered_promise.set_value();
+        m_release_future.wait();
+    }
+
+private:
+    std::promise<void>& m_entered_promise;
+    std::shared_future<void> m_release_future;
+};
+
+class ThrowingLogitTransformer : public LogitTransformers::ILogitTransformer {
+public:
+    ThrowingLogitTransformer(std::shared_future<void> blocking_worker_entered,
+                             std::promise<void>& throwing_worker_entered) :
+        m_blocking_worker_entered(std::move(blocking_worker_entered)),
+        m_throwing_worker_entered(throwing_worker_entered) {}
+
+    void apply(Logits&) override {
+        m_blocking_worker_entered.wait();
+        m_throwing_worker_entered.set_value();
+        OPENVINO_THROW("injected sampler worker failure");
+    }
+
+private:
+    std::shared_future<void> m_blocking_worker_entered;
+    std::promise<void>& m_throwing_worker_entered;
+};
+
+class TestLogitProcessor : public LogitProcessor {
+public:
+    using LogitProcessor::LogitProcessor;
+
+    void set_transformer(std::shared_ptr<LogitTransformers::ILogitTransformer> transformer) {
+        m_logit_transformers = {std::move(transformer)};
+    }
+};
+
+void inject_transformer(Sampler& sampler,
+                        uint64_t request_id,
+                        const SequenceGroup::Ptr& sequence_group,
+                        std::shared_ptr<LogitTransformers::ILogitTransformer> transformer) {
+    const GenerationConfig& sampling_config = sequence_group->get_sampling_parameters();
+    sampler.create_logit_processor(request_id, sampling_config, sequence_group->get_prompt_ids());
+    TestLogitProcessor test_processor(sampling_config, sequence_group->get_prompt_ids());
+    test_processor.set_transformer(std::move(transformer));
+    sampler.get_logit_processor(request_id) = std::move(test_processor);
+}
+
+SequenceGroup::Ptr make_scheduled_group(uint64_t request_id, GenerationConfig sampling_config = ov::genai::utils::get_greedy_config()) {
+    const std::vector<int64_t> prompt{0};
+    ov::Tensor input_tensor(ov::element::i64, ov::Shape{1, prompt.size()}, prompt.data());
+    auto sequence_group = std::make_shared<SequenceGroup>(request_id, input_tensor, sampling_config);
+    sequence_group->schedule_tokens(sequence_group->get_num_available_tokens_for_batching());
+    return sequence_group;
+}
+
+ov::Tensor make_logits(size_t num_tokens) {
+    constexpr size_t vocab_size = 2;
+    ov::Tensor logits(ov::element::f32, ov::Shape{num_tokens, 1, vocab_size});
+    std::fill_n(logits.data<float>(), logits.get_size(), 0.0f);
+    for (size_t token_id = 0; token_id < num_tokens; ++token_id) {
+        logits.data<float>()[token_id * vocab_size + 1] = 1.0f;
+    }
+    return logits;
+}
+
+}  // namespace
+
+TEST(SamplerWorkerJoiningTest, waits_for_blocked_worker_and_preserves_worker_exception) {
+    SequenceGroup::Ptr failing_group = make_scheduled_group(0);
+    SequenceGroup::Ptr blocked_group = make_scheduled_group(1);
+    std::vector<SequenceGroup::Ptr> sequence_groups{failing_group, blocked_group};
+    ov::Tensor logits = make_logits(2);
+    WorkerGate worker_gate;
+    std::promise<void> blocking_worker_entered_promise;
+    std::shared_future<void> blocking_worker_entered = blocking_worker_entered_promise.get_future().share();
+    std::promise<void> throwing_worker_entered_promise;
+    std::future<void> throwing_worker_entered = throwing_worker_entered_promise.get_future();
+    {
+        Sampler sampler(2);
+        inject_transformer(
+            sampler,
+            blocked_group->get_request_id(),
+            blocked_group,
+            std::make_shared<BlockingLogitTransformer>(blocking_worker_entered_promise,
+                                                        worker_gate.get_release_future()));
+        inject_transformer(
+            sampler,
+            failing_group->get_request_id(),
+            failing_group,
+            std::make_shared<ThrowingLogitTransformer>(blocking_worker_entered, throwing_worker_entered_promise));
+
+        std::future<SamplerOutput> sampling_result = std::async(std::launch::async, [&] {
+            return sampler.sample(sequence_groups, logits, false);
+        });
+        WorkerGateReleaseGuard worker_gate_release_guard(worker_gate);
+
+        EXPECT_EQ(throwing_worker_entered.wait_for(5s), std::future_status::ready);
+        EXPECT_EQ(sampling_result.wait_for(100ms), std::future_status::timeout);
+        worker_gate.release();
+        EXPECT_THROW(
+            {
+                try {
+                    sampling_result.get();
+                } catch (const ov::Exception& exception) {
+                    EXPECT_NE(std::string(exception.what()).find("injected sampler worker failure"), std::string::npos);
+                    throw;
+                }
+            },
+            ov::Exception);
+
+        sampler.clear_request_info(0);
+        sampler.clear_request_info(1);
+    }
+
+    EXPECT_EQ(blocked_group->get_sequences().front()->get_generated_ids(), TokenIds({1}));
+}
+
+TEST(SamplerWorkerJoiningTest, waits_for_submitted_worker_on_submission_loop_failure) {
+    SequenceGroup::Ptr submitted_group = make_scheduled_group(0);
+    SequenceGroup::Ptr duplicate_group = make_scheduled_group(0);
+    std::vector<SequenceGroup::Ptr> sequence_groups{submitted_group, duplicate_group};
+    ov::Tensor logits = make_logits(2);
+    WorkerGate worker_gate;
+    std::promise<void> blocking_worker_entered_promise;
+    std::future<void> blocking_worker_entered = blocking_worker_entered_promise.get_future();
+    {
+        Sampler sampler(1);
+        inject_transformer(
+            sampler,
+            submitted_group->get_request_id(),
+            submitted_group,
+            std::make_shared<BlockingLogitTransformer>(blocking_worker_entered_promise,
+                                                        worker_gate.get_release_future()));
+
+        std::future<SamplerOutput> sampling_result = std::async(std::launch::async, [&] {
+            return sampler.sample(sequence_groups, logits, false);
+        });
+        WorkerGateReleaseGuard worker_gate_release_guard(worker_gate);
+
+        EXPECT_EQ(blocking_worker_entered.wait_for(5s), std::future_status::ready);
+        EXPECT_EQ(sampling_result.wait_for(100ms), std::future_status::timeout);
+        worker_gate.release();
+        EXPECT_THROW(
+            {
+                try {
+                    sampling_result.get();
+                } catch (const std::exception& exception) {
+                    EXPECT_NE(std::string(exception.what()).find("already submitted"), std::string::npos);
+                    throw;
+                }
+            },
+            std::exception);
+
+        sampler.clear_request_info(0);
+    }
+
+    EXPECT_EQ(submitted_group->get_sequences().front()->get_generated_ids(), TokenIds({1}));
+}
+
+TEST(SamplerWorkerJoiningTest, preserves_successful_multi_request_results) {
+    SequenceGroup::Ptr first_group = make_scheduled_group(0);
+    SequenceGroup::Ptr second_group = make_scheduled_group(1);
+    std::vector<SequenceGroup::Ptr> sequence_groups{first_group, second_group};
+    ov::Tensor logits = make_logits(2);
+    Sampler sampler(2);
+
+    const SamplerOutput output = sampler.sample(sequence_groups, logits, false);
+
+    EXPECT_EQ(output.num_generated_tokens, 2);
+    EXPECT_EQ(output.num_generated_tokens_per_request.at(0), 1);
+    EXPECT_EQ(output.num_generated_tokens_per_request.at(1), 1);
+    EXPECT_EQ(first_group->get_sequences().front()->get_generated_ids(), TokenIds({1}));
+    EXPECT_EQ(second_group->get_sequences().front()->get_generated_ids(), TokenIds({1}));
+    EXPECT_TRUE(first_group->get_generation_stream()->can_read());
+    EXPECT_TRUE(second_group->get_generation_stream()->can_read());
+}
+
+TEST(SamplerNotificationTest, defers_generated_output_until_explicit_notification) {
+    SequenceGroup::Ptr sequence_group = make_scheduled_group(0);
+    std::vector<SequenceGroup::Ptr> sequence_groups{sequence_group};
+    Sampler sampler;
+
+    const SamplerOutput output = sampler.sample(sequence_groups, make_logits(1), false, false);
+
+    ASSERT_EQ(output.num_generated_tokens, 1);
+    EXPECT_EQ(sequence_group->get_sequences().front()->get_generated_ids(), TokenIds({1}));
+    EXPECT_FALSE(sequence_group->get_generation_stream()->can_read());
+
+    sequence_group->notify_handle();
+    ASSERT_TRUE(sequence_group->get_generation_stream()->can_read());
+    const GenerationOutputs generation_outputs = sequence_group->get_generation_stream()->read();
+    EXPECT_EQ(generation_outputs.at(0).generated_ids, TokenIds({1}));
+}
+
+TEST(SamplerNotificationTest, defers_terminal_output_until_explicit_notification) {
+    GenerationConfig sampling_config = ov::genai::utils::get_greedy_config();
+    sampling_config.max_new_tokens = 1;
+    SequenceGroup::Ptr sequence_group = make_scheduled_group(0, sampling_config);
+    std::vector<SequenceGroup::Ptr> sequence_groups{sequence_group};
+    Sampler sampler;
+
+    const SamplerOutput output = sampler.sample(sequence_groups, make_logits(1), false, false);
+
+    ASSERT_EQ(output.m_dropped_sequences.size(), 1);
+    EXPECT_TRUE(sequence_group->has_finished());
+    EXPECT_EQ(sequence_group->get_generation_stream()->get_status(), GenerationStatus::RUNNING);
+    EXPECT_FALSE(sequence_group->get_generation_stream()->can_read());
+
+    sequence_group->notify_handle();
+    EXPECT_EQ(sequence_group->get_generation_stream()->get_status(), GenerationStatus::FINISHED);
+    ASSERT_TRUE(sequence_group->get_generation_stream()->can_read());
+    EXPECT_EQ(sequence_group->get_generation_stream()->read().at(0).generated_ids, TokenIds({1}));
+}
+
+TEST(SamplerNotificationTest, precommitFailurePublishesNoGeneratedOutputAndPreservesException) {
+    SequenceGroup::Ptr sequence_group = make_scheduled_group(0);
+    std::vector<SequenceGroup::Ptr> sequence_groups{sequence_group};
+    Sampler sampler;
+    sampler.sample(sequence_groups, make_logits(1), false, false);
+    ASSERT_FALSE(sequence_group->get_generation_stream()->can_read());
+
+    sequence_group->fail_generation(std::make_exception_ptr(std::runtime_error("injected precommit failure")));
+
+    EXPECT_THROW(
+        try {
+            sequence_group->get_generation_stream()->read();
+        } catch (const std::runtime_error& error) {
+            EXPECT_STREQ(error.what(), "injected precommit failure");
+            throw;
+        },
+        std::runtime_error);
+}
+
+TEST(SamplerNotificationTest, deferredEchoUsesPreCounterUpdateRange) {
+    GenerationConfig sampling_config = ov::genai::utils::get_greedy_config();
+    sampling_config.echo = true;
+    sampling_config.max_new_tokens = 0;
+    const std::vector<int64_t> prompt{4, 5};
+    ov::Tensor input_tensor(ov::element::i64, ov::Shape{1, prompt.size()}, prompt.data());
+    SequenceGroup::Ptr sequence_group = std::make_shared<SequenceGroup>(0, input_tensor, sampling_config);
+    sequence_group->schedule_tokens(1);
+    sequence_group->append_prompt_log_prob(1.0f);
+    sequence_group->append_prompt_log_prob(2.0f);
+    const size_t first_token_position = sequence_group->get_num_processed_tokens();
+    const size_t last_token_position = sequence_group->get_context_len();
+    sequence_group->finish_iteration();
+
+    sequence_group->notify_handle_echo_only(first_token_position, last_token_position);
+
+    const GenerationOutputs outputs = sequence_group->get_generation_stream()->read();
+    EXPECT_EQ(outputs.at(0).generated_ids, TokenIds({4}));
+    EXPECT_EQ(outputs.at(0).generated_log_probs, LogProbs({1.0f}));
+}
 
 TEST(SamplerStopTokenIdsTest, single_stop_token_match) {
     std::vector<int64_t> generated_tokens = {3, 4, 5, 6, 7, 8, 9};
@@ -71,13 +379,47 @@ TEST(SamplerValidationMode, gen_phase_to_cut_whole_seq) {
     ov::Tensor gen_input_ids(ov::element::f32, ov::Shape{4, 1, 5}, logits.data());
 
     Sampler sampler;
-    sampler.sample(sequence_groups, gen_input_ids, true);
+    const SamplerOutput output = sampler.sample(sequence_groups, gen_input_ids, true);
 
     TokenIds actual = sequence_groups.front()->get_sequences().front()->get_generated_ids(),
              expected{0, 1};
     ASSERT_EQ(sequence_groups.front()->get_sequences().front()->get_generated_ids(), expected);
-    EXPECT_EQ(sequence_groups.front()->get_num_processed_tokens(), processed_before + 1)
-        << "Full rejection must retain the target replacement token as accepted depth one";
+    EXPECT_EQ(sequence_groups.front()->get_num_processed_tokens(), processed_before + 1);
+    const uint64_t sequence_id = sequence_groups.front()->get_sequences().front()->get_id();
+    EXPECT_EQ(output.acceptance_by_sequence.at(sequence_id).accepted_depth, 1u);
+    EXPECT_EQ(output.acceptance_by_sequence.at(sequence_id).processed_tokens_after, processed_before + 1)
+        << "Full rejection must prepare the target replacement token as accepted depth one";
+}
+
+TEST(SamplerValidationMode, explicit_deferral_preserves_counters_until_cache_commit) {
+    auto sampling_config = ov::genai::utils::get_greedy_config();
+    const std::vector<int64_t> prompt{0, 1, 2, 3, 4};
+    auto sequence_group = std::make_shared<SequenceGroup>(0, prompt, sampling_config);
+    Sequence::Ptr sequence = sequence_group->get_sequences().front();
+    sequence->append_token(0, 1.f);
+    constexpr size_t processed_before = 5;
+    sequence_group->update_processed_tokens_num(processed_before);
+    for (const int64_t token_id : {2, 3, 4}) {
+        sequence->append_token(token_id, 1.f);
+    }
+    sequence_group->set_num_validated_tokens(3);
+    sequence_group->schedule_tokens(sequence_group->get_num_available_tokens_for_batching());
+    std::vector<float> logits{
+        0, 1.f, 0, 0, 0,
+        0, 0, 1.f, 0, 0,
+        0, 0, 0, 1.f, 0,
+        0, 0, 0, 0, 1.f,
+    };
+    ov::Tensor validation_logits(ov::element::f32, ov::Shape{4, 1, 5}, logits.data());
+
+    Sampler sampler;
+    const SamplerOutput output = sampler.sample(
+        {sequence_group}, validation_logits, true, false, true);
+
+    EXPECT_EQ(sequence_group->get_num_processed_tokens(), processed_before);
+    ASSERT_EQ(output.acceptance_by_sequence.count(sequence->get_id()), 1u);
+    EXPECT_EQ(output.acceptance_by_sequence.at(sequence->get_id()).processed_tokens_after,
+              processed_before + 1);
 }
 
 TEST(SamplerValidationMode, gen_phase_to_cut_part_seq) {
@@ -118,11 +460,13 @@ TEST(SamplerValidationMode, gen_phase_to_cut_part_seq) {
     ov::Tensor gen_input_ids(ov::element::f32, ov::Shape{4, 1, 5}, logits.data());
 
     Sampler sampler;
-    sampler.sample(sequence_groups, gen_input_ids, true);
+    const SamplerOutput output = sampler.sample(sequence_groups, gen_input_ids, true);
 
     TokenIds actual = sequence_groups.front()->get_sequences().front()->get_generated_ids(),
              expected{0, 1, 2, 3};
     ASSERT_EQ(sequence_groups.front()->get_sequences().front()->get_generated_ids(), expected);
+    const uint64_t sequence_id = sequence_groups.front()->get_sequences().front()->get_id();
+    EXPECT_EQ(output.acceptance_by_sequence.at(sequence_id).accepted_depth, 3u);
 }
 
 TEST(SamplerValidationMode, gen_phase) {
@@ -162,11 +506,79 @@ TEST(SamplerValidationMode, gen_phase) {
     ov::Tensor gen_input_ids(ov::element::f32, ov::Shape{4, 1, 5}, logits.data());
 
     Sampler sampler;
-    sampler.sample(sequence_groups, gen_input_ids, true);
+    const SamplerOutput output = sampler.sample(sequence_groups, gen_input_ids, true);
 
     TokenIds actual = sequence_groups.front()->get_sequences().front()->get_generated_ids(),
              expected{0, 1, 2, 3, 4};
     ASSERT_EQ(sequence_groups.front()->get_sequences().front()->get_generated_ids(), expected);
+    const uint64_t sequence_id = sequence_groups.front()->get_sequences().front()->get_id();
+    EXPECT_EQ(output.acceptance_by_sequence.at(sequence_id).accepted_depth, 4u);
+}
+
+TEST(SamplerValidationMode, terminal_stop_token_preserves_acceptance_result) {
+    auto sampling_config = ov::genai::utils::get_greedy_config();
+    sampling_config.stop_token_ids = {2};
+    const std::vector<int64_t> prompt{0, 1, 2, 3, 4};
+    ov::Tensor input_tensor(ov::element::i64, ov::Shape{1, prompt.size()}, const_cast<int64_t*>(prompt.data()));
+    auto sequence_group = std::make_shared<SequenceGroup>(0, input_tensor, sampling_config);
+    Sequence::Ptr sequence = sequence_group->get_sequences().front();
+    sequence->append_token(0, 1.f);
+    sequence_group->update_processed_tokens_num(prompt.size());
+    for (int64_t token_id = 1; token_id <= 3; ++token_id) {
+        sequence->append_token(token_id, 1.f);
+    }
+    sequence_group->set_num_validated_tokens(3);
+    sequence_group->schedule_tokens(sequence_group->get_num_available_tokens_for_batching());
+
+    std::vector<float> logits{
+        0, 1.f, 0, 0, 0,
+        0, 0, 1.f, 0, 0,
+        0, 0, 0, 1.f, 0,
+        0, 0, 0, 0, 1.f,
+    };
+    ov::Tensor validation_logits(ov::element::f32, ov::Shape{4, 1, 5}, logits.data());
+    const uint64_t sequence_id = sequence->get_id();
+
+    Sampler sampler;
+    const SamplerOutput output = sampler.sample({sequence_group}, validation_logits, true);
+
+    EXPECT_TRUE(sequence->has_finished());
+    EXPECT_EQ(sequence->get_finish_reason(), GenerationFinishReason::STOP);
+    ASSERT_EQ(output.acceptance_by_sequence.count(sequence_id), 1u);
+    EXPECT_EQ(output.acceptance_by_sequence.at(sequence_id).accepted_depth, 2u);
+}
+
+TEST(SamplerValidationMode, terminal_length_limit_preserves_acceptance_result) {
+    auto sampling_config = ov::genai::utils::get_greedy_config();
+    sampling_config.max_new_tokens = 3;
+    const std::vector<int64_t> prompt{0, 1, 2, 3, 4};
+    ov::Tensor input_tensor(ov::element::i64, ov::Shape{1, prompt.size()}, const_cast<int64_t*>(prompt.data()));
+    auto sequence_group = std::make_shared<SequenceGroup>(0, input_tensor, sampling_config);
+    Sequence::Ptr sequence = sequence_group->get_sequences().front();
+    sequence->append_token(0, 1.f);
+    sequence_group->update_processed_tokens_num(prompt.size());
+    for (int64_t token_id = 1; token_id <= 3; ++token_id) {
+        sequence->append_token(token_id, 1.f);
+    }
+    sequence_group->set_num_validated_tokens(3);
+    sequence_group->schedule_tokens(sequence_group->get_num_available_tokens_for_batching());
+
+    std::vector<float> logits{
+        0, 1.f, 0, 0, 0,
+        0, 0, 1.f, 0, 0,
+        0, 0, 0, 1.f, 0,
+        0, 0, 0, 0, 1.f,
+    };
+    ov::Tensor validation_logits(ov::element::f32, ov::Shape{4, 1, 5}, logits.data());
+    const uint64_t sequence_id = sequence->get_id();
+
+    Sampler sampler;
+    const SamplerOutput output = sampler.sample({sequence_group}, validation_logits, true);
+
+    EXPECT_TRUE(sequence->has_finished());
+    EXPECT_EQ(sequence->get_finish_reason(), GenerationFinishReason::LENGTH);
+    ASSERT_EQ(output.acceptance_by_sequence.count(sequence_id), 1u);
+    EXPECT_EQ(output.acceptance_by_sequence.at(sequence_id).accepted_depth, 2u);
 }
 
 TEST(SamplerValidationMode, prompt_phase_to_cut_part_seq) {
@@ -303,4 +715,416 @@ TEST(SamplerValidationMode, prompt_phase) {
     TokenIds actual = sequence_groups.front()->get_sequences().front()->get_generated_ids(),
              expected{0, 1, 2, 3};
     ASSERT_EQ(sequence_groups.front()->get_sequences().front()->get_generated_ids(), expected);
+}
+
+namespace {
+
+constexpr int64_t DRAFT_MASK_TOKEN = 99;
+constexpr size_t DRAFT_VOCAB_SIZE = 64;
+
+// A DFlash draft request whose window was scheduled from position 0: a prompt of `prompt_len` tokens, then
+// `tokens` (the seed and the mask placeholders). The model runner kept `gathered_rows` candidate rows.
+SequenceGroup::Ptr make_dflash_draft_group(uint64_t request_id,
+                                           size_t prompt_len,
+                                           const TokenIds& tokens,
+                                           size_t scheduled_rows,
+                                           size_t gathered_rows,
+                                           size_t max_new_tokens = 100) {
+    TokenIds prompt(prompt_len);
+    std::iota(prompt.begin(), prompt.end(), 0);
+    GenerationConfig config = utils::get_greedy_config();
+    config.max_new_tokens = max_new_tokens;
+    auto group = std::make_shared<SequenceGroup>(request_id, prompt, config);
+    for (const int64_t token : tokens) {
+        group->get_running_sequences().front()->append_token(token, 0.0f);
+    }
+    group->schedule_tokens(scheduled_rows);
+    group->set_output_seq_len(gathered_rows);
+    return group;
+}
+
+// One logits row per token, whose argmax is that token.
+ov::Tensor make_candidate_logits(const TokenIds& argmax_tokens) {
+    ov::Tensor logits(ov::element::f32, ov::Shape{argmax_tokens.size(), 1, DRAFT_VOCAB_SIZE});
+    std::fill_n(logits.data<float>(), logits.get_size(), 0.0f);
+    for (size_t row = 0; row < argmax_tokens.size(); ++row) {
+        logits.data<float>()[row * DRAFT_VOCAB_SIZE + argmax_tokens[row]] = 1.0f;
+    }
+    return logits;
+}
+
+TokenIds generated_ids(const SequenceGroup::Ptr& group) {
+    return group->get_running_sequences().front()->get_generated_ids();
+}
+
+}  // namespace
+
+TEST(SamplerBlockSampling, replaces_the_placeholders_of_each_request_in_one_call) {
+    Sampler sampler(2);
+    sampler.set_block_sampling(1);
+    // [4 prompt rows ; seed + 3 masks] and [2 prompt rows ; seed + 3 masks]: the 3 mask rows are the candidates
+    auto first = make_dflash_draft_group(0, 4, {7, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN}, 8, 3);
+    auto second = make_dflash_draft_group(1, 2, {5, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN}, 6, 3);
+
+    const auto output = sampler.sample({first, second}, make_candidate_logits({20, 21, 22, 30, 31, 32}), false, false);
+
+    EXPECT_EQ(generated_ids(first), (TokenIds{7, 20, 21, 22}));
+    EXPECT_EQ(generated_ids(second), (TokenIds{5, 30, 31, 32}));
+    EXPECT_EQ(output.num_generated_tokens, 6);
+}
+
+TEST(SamplerBlockSampling, deepspec_candidates_start_at_the_seed_row) {
+    Sampler sampler;
+    sampler.set_block_sampling(0);
+    // [4 prompt rows ; seed + 2 masks]: the seed and the 2 mask rows are the candidates
+    auto group = make_dflash_draft_group(0, 4, {7, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN}, 7, 3);
+
+    sampler.sample({group}, make_candidate_logits({20, 21, 22}), false, false);
+
+    EXPECT_EQ(generated_ids(group), (TokenIds{7, 20, 21, 22}));
+}
+
+TEST(SamplerBlockSampling, keeps_only_the_candidates_the_target_can_validate) {
+    Sampler sampler;
+    sampler.set_block_sampling(1);
+    // 3 new tokens allowed and the seed is the first: the target validates 1 candidate and generates the last token
+    auto group = make_dflash_draft_group(0, 4, {7, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN}, 8, 3,
+                                         /*max_new_tokens=*/3);
+
+    sampler.sample({group}, make_candidate_logits({20, 21, 22}), false, false);
+
+    EXPECT_EQ(generated_ids(group), (TokenIds{7, 20}));
+}
+
+TEST(SamplerBlockSampling, samples_the_forwarded_candidates_of_a_partly_run_window) {
+    Sampler sampler;
+    sampler.set_block_sampling(1);
+    // the scheduler ran the prompt, the seed and the first mask row of the first window
+    auto cut_in_block = make_dflash_draft_group(0, 4, {7, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN}, 6, 1);
+    // and only the prompt and the seed of the second, so it has no candidate row
+    auto cut_at_seed = make_dflash_draft_group(1, 4, {7, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN}, 5, 0);
+
+    sampler.sample({cut_in_block, cut_at_seed}, make_candidate_logits({20}), false, false);
+
+    EXPECT_EQ(generated_ids(cut_in_block), (TokenIds{7, 20}));
+    EXPECT_EQ(generated_ids(cut_at_seed), (TokenIds{7, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN}));
+}
+
+namespace {
+
+// A row source whose row after token t has its best logit at t + 1, and which has no row past position max_rows.
+// Its draw() returns drawn_tokens when there are any.
+class ChainRowSource : public BlockRowSource {
+public:
+    explicit ChainRowSource(bool position_major, size_t max_rows = DRAFT_VOCAB_SIZE)
+        : m_position_major(position_major),
+          m_max_rows(max_rows) {}
+
+    void prepare(const std::vector<SampledBlock>& blocks, const ov::Tensor&) override {
+        prepared = blocks;
+    }
+
+    bool is_position_major() const override {
+        return m_position_major;
+    }
+
+    void step(size_t position,
+              const std::vector<size_t>& blocks,
+              const std::vector<int64_t>& previous_tokens) override {
+        steps.push_back({position, blocks, previous_tokens});
+    }
+
+    std::optional<std::vector<BlockToken>> draw(size_t, const GenerationConfig&) const override {
+        if (drawn_tokens.empty()) {
+            return std::nullopt;
+        }
+        return drawn_tokens;
+    }
+
+    bool fill_row(size_t, size_t position, int64_t previous_token, float* row) const override {
+        if (position >= m_max_rows) {
+            return false;
+        }
+        std::fill_n(row, DRAFT_VOCAB_SIZE, 0.0f);
+        row[previous_token + 1] = 1.0f;
+        return true;
+    }
+
+    struct Step {
+        size_t position;
+        std::vector<size_t> blocks;
+        std::vector<int64_t> previous_tokens;
+    };
+
+    std::vector<SampledBlock> prepared;
+    std::vector<Step> steps;
+    std::vector<BlockToken> drawn_tokens;
+
+private:
+    bool m_position_major;
+    size_t m_max_rows;
+};
+
+}  // namespace
+
+TEST(SamplerBlockSampling, row_source_draws_every_token_from_the_row_after_the_token_before) {
+    Sampler sampler(2);
+    auto source = std::make_shared<ChainRowSource>(false);
+    sampler.set_block_sampling(1, source);
+    auto first = make_dflash_draft_group(0, 4, {7, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN}, 8, 3);
+    // the target validates one candidate of the second block
+    auto second = make_dflash_draft_group(1,
+                                          2,
+                                          {5, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN},
+                                          6,
+                                          3,
+                                          /*max_new_tokens=*/3);
+
+    const auto output = sampler.sample({first, second}, make_candidate_logits({0, 0, 0, 0, 0, 0}), false, false);
+
+    EXPECT_EQ(generated_ids(first), (TokenIds{7, 8, 9, 10}));
+    EXPECT_EQ(generated_ids(second), (TokenIds{5, 6}));
+    EXPECT_EQ(output.num_generated_tokens, 4);
+    ASSERT_EQ(source->prepared.size(), 2);
+    EXPECT_EQ(source->prepared[0].anchor_token, 7);
+    EXPECT_EQ(source->prepared[0].first_row, 0);
+    EXPECT_EQ(source->prepared[0].num_rows, 3);
+    EXPECT_EQ(source->prepared[0].num_candidates, 3);
+    EXPECT_EQ(source->prepared[1].anchor_token, 5);
+    EXPECT_EQ(source->prepared[1].first_row, 3);
+    EXPECT_EQ(source->prepared[1].num_rows, 3);
+    EXPECT_EQ(source->prepared[1].num_candidates, 1);
+    EXPECT_TRUE(source->steps.empty());
+}
+
+TEST(SamplerBlockSampling, position_major_row_source_steps_the_blocks_that_still_draw) {
+    Sampler sampler(2);
+    auto source = std::make_shared<ChainRowSource>(true);
+    sampler.set_block_sampling(1, source);
+    auto first = make_dflash_draft_group(0, 4, {7, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN}, 8, 3);
+    auto second = make_dflash_draft_group(1,
+                                          2,
+                                          {5, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN},
+                                          6,
+                                          3,
+                                          /*max_new_tokens=*/3);
+
+    sampler.sample({first, second}, make_candidate_logits({0, 0, 0, 0, 0, 0}), false, false);
+
+    EXPECT_EQ(generated_ids(first), (TokenIds{7, 8, 9, 10}));
+    EXPECT_EQ(generated_ids(second), (TokenIds{5, 6}));
+    ASSERT_EQ(source->steps.size(), 3);
+    EXPECT_EQ(source->steps[0].blocks, (std::vector<size_t>{0, 1}));
+    EXPECT_EQ(source->steps[0].previous_tokens, (std::vector<int64_t>{7, 5}));
+    EXPECT_EQ(source->steps[1].blocks, (std::vector<size_t>{0}));
+    EXPECT_EQ(source->steps[1].previous_tokens, (std::vector<int64_t>{8}));
+    EXPECT_EQ(source->steps[2].position, 2);
+    EXPECT_EQ(source->steps[2].previous_tokens, (std::vector<int64_t>{9}));
+}
+
+TEST(SamplerBlockSampling, row_source_ends_a_block_at_a_position_without_a_row) {
+    for (const bool position_major : {false, true}) {
+        Sampler sampler;
+        auto source = std::make_shared<ChainRowSource>(position_major, 2);
+        sampler.set_block_sampling(1, source);
+        auto group = make_dflash_draft_group(0, 4, {7, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN}, 8, 3);
+        // a window cut at the seed gathers no row, so the source does not see it
+        auto cut_at_seed =
+            make_dflash_draft_group(1, 4, {7, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN}, 5, 0);
+
+        const auto output = sampler.sample({group, cut_at_seed}, make_candidate_logits({0, 0, 0}), false, false);
+
+        EXPECT_EQ(generated_ids(group), (TokenIds{7, 8, 9}));
+        EXPECT_EQ(output.num_generated_tokens_per_request.at(0), 2);
+        EXPECT_EQ(generated_ids(cut_at_seed), (TokenIds{7, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN}));
+        EXPECT_EQ(source->prepared.size(), 1);
+    }
+}
+
+TEST(SamplerBlockSampling, row_source_appends_the_tokens_it_draws_for_a_whole_block) {
+    Sampler sampler;
+    auto source = std::make_shared<ChainRowSource>(false);
+    source->drawn_tokens = {{21, -0.5f}, {30, 0.0f}};
+    sampler.set_block_sampling(1, source);
+    auto group = make_dflash_draft_group(0, 4, {7, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN, DRAFT_MASK_TOKEN}, 8, 3);
+
+    const auto output = sampler.sample({group}, make_candidate_logits({0, 0, 0}), false, false);
+
+    const auto sequence = group->get_running_sequences().front();
+    EXPECT_EQ(sequence->get_generated_ids(), (TokenIds{7, 21, 30}));
+    EXPECT_FLOAT_EQ(sequence->get_generated_log_probs()[1], -0.5f);
+    EXPECT_EQ(output.num_generated_tokens_per_request.at(0), 2);
+}
+
+namespace {
+// Emulates a processed prompt [0, 1, 2, 3, 4] followed by the main model's token 0, then appends the draft candidates
+// and schedules them for validation.
+SequenceGroup::Ptr make_validation_group(const GenerationConfig& config, const std::vector<int64_t>& candidates) {
+    std::vector<int64_t> input_vector{0, 1, 2, 3, 4};
+    ov::Tensor input_tensor(ov::element::i64, ov::Shape{1, 5}, input_vector.data());
+    auto group = std::make_shared<SequenceGroup>(0, input_tensor, config);
+    auto sequence = group->get_sequences().front();
+    sequence->append_token(0, 1.f);
+    group->update_processed_tokens_num(input_vector.size());
+    for (const auto candidate : candidates) {
+        sequence->append_token(candidate, 1.f);
+    }
+    group->set_num_validated_tokens(candidates.size());
+    group->schedule_tokens(group->get_num_available_tokens_for_batching());
+    return group;
+}
+}  // namespace
+
+// min_new_tokens = 2 masks the stop token for the first two generated tokens only, so the stop candidate drafted as
+// the fourth token must be accepted.
+TEST(SamplerValidationMode, lifts_min_new_tokens_mask_inside_validation_window) {
+    auto config = ov::genai::utils::get_greedy_config();
+    config.max_new_tokens = 30;
+    config.min_new_tokens = 2;
+    config.stop_token_ids = {4};
+    auto group = make_validation_group(config, {1, 2, 4});
+    std::vector<float> logits = {
+        0, 5.f, 0, 0, 0,
+        0, 0, 5.f, 0, 0,
+        1.f, 0, 0, 0, 5.f,
+        5.f, 0, 0, 0, 0,
+    };
+    Sampler sampler;
+    sampler.sample({group}, ov::Tensor(ov::element::f32, ov::Shape{4, 1, 5}, logits.data()), true);
+
+    EXPECT_EQ(group->get_sequences().front()->get_generated_ids(), (TokenIds{0, 1, 2, 4}));
+}
+
+// min_new_tokens = 5 masks the stop token for the first five generated tokens. Rejecting candidate 2 in favour of 3
+// leaves three generated tokens, so the stop token must stay masked at the fourth even though its logit is largest.
+TEST(SamplerValidationMode, keeps_min_new_tokens_mask_after_rejection) {
+    auto config = ov::genai::utils::get_greedy_config();
+    config.max_new_tokens = 30;
+    config.min_new_tokens = 5;
+    config.stop_token_ids = {4};
+    auto group = make_validation_group(config, {1, 2});
+    auto sequence = group->get_sequences().front();
+    std::vector<float> window_logits = {
+        0, 5.f, 0, 0, 0,
+        0, 0, 0, 5.f, 0,
+        5.f, 0, 0, 0, 0,
+    };
+    Sampler sampler;
+    sampler.sample({group}, ov::Tensor(ov::element::f32, ov::Shape{3, 1, 5}, window_logits.data()), true);
+    ASSERT_EQ(sequence->get_generated_ids(), (TokenIds{0, 1, 3}));
+
+    group->schedule_tokens(group->get_num_available_tokens_for_batching());
+    std::vector<float> next_logits = {0, 0, 4.f, 0, 5.f};
+    sampler.sample({group}, ov::Tensor(ov::element::f32, ov::Shape{1, 1, 5}, next_logits.data()), true);
+
+    EXPECT_EQ(sequence->get_generated_ids(), (TokenIds{0, 1, 3, 2}));
+    EXPECT_FALSE(sequence->has_finished());
+}
+
+namespace {
+// Drafts three candidates as a single EAGLE3 tree path below the main model's token 0.
+SequenceGroup::Ptr make_tree_validation_group(size_t min_new_tokens, const std::vector<int64_t>& candidates) {
+    GenerationConfig config;
+    config.max_new_tokens = 30;
+    config.min_new_tokens = min_new_tokens;
+    config.stop_token_ids = {4};
+    config.tree_depth = 3;
+    config.branching_factor = 1;
+    config.num_assistant_tokens = 3;
+    auto group = make_validation_group(config, candidates);
+    TreeMetaData tree_metadata;
+    tree_metadata.retrieve_indices = {{0, 1, 2, 3}};
+    group->get_sequences().front()->set_tree_metadata(tree_metadata);
+    return group;
+}
+}  // namespace
+
+// min_new_tokens = 2 masks the stop token for the first two generated tokens only, so the stop candidate at the
+// third tree depth, the fourth generated token, must be accepted.
+TEST(SamplerValidationMode, lifts_min_new_tokens_mask_inside_tree_window) {
+    auto group = make_tree_validation_group(2, {1, 2, 4});
+    std::vector<float> logits = {
+        0, 5.f, 0, 0, 0,
+        0, 0, 5.f, 0, 0,
+        1.f, 0, 0, 0, 5.f,
+        5.f, 0, 0, 0, 0,
+    };
+    Sampler sampler;
+    sampler.sample({group}, ov::Tensor(ov::element::f32, ov::Shape{4, 1, 5}, logits.data()), true);
+
+    EXPECT_EQ(group->get_sequences().front()->get_generated_ids(), (TokenIds{0, 1, 2, 4}));
+}
+
+// min_new_tokens = 4 masks the stop token for the first four generated tokens only, so the bonus token after three
+// accepted tree candidates may be the stop token.
+TEST(SamplerValidationMode, lifts_min_new_tokens_mask_for_tree_bonus_token) {
+    auto group = make_tree_validation_group(4, {1, 2, 3});
+    std::vector<float> logits = {
+        0, 5.f, 0, 0, 0,
+        0, 0, 5.f, 0, 0,
+        0, 0, 0, 5.f, 0,
+        1.f, 0, 0, 0, 5.f,
+    };
+    Sampler sampler;
+    sampler.sample({group}, ov::Tensor(ov::element::f32, ov::Shape{4, 1, 5}, logits.data()), true);
+
+    EXPECT_EQ(group->get_sequences().front()->get_generated_ids(), (TokenIds{0, 1, 2, 3, 4}));
+}
+
+// Accepted candidates report the main model's log-probabilities, and the sequence score must follow them.
+TEST(SamplerValidationMode, accepted_candidates_update_sequence_score) {
+    auto config = ov::genai::utils::get_greedy_config();
+    config.max_new_tokens = 30;
+    auto group = make_validation_group(config, {1, 2});
+    auto sequence = group->get_sequences().front();
+    std::vector<float> logits = {
+        0, 2.f, 0, 0, 0,
+        0, 0, 3.f, 0, 0,
+        0, 0, 0, 1.f, 0,
+    };
+    Sampler sampler;
+    sampler.sample({group}, ov::Tensor(ov::element::f32, ov::Shape{3, 1, 5}, logits.data()), true);
+    ASSERT_EQ(sequence->get_generated_ids(), (TokenIds{0, 1, 2, 3}));
+
+    const auto& log_probs = sequence->get_generated_log_probs();
+    float sum = 0.0f;
+    for (const auto log_prob : log_probs) {
+        sum += log_prob;
+    }
+    EXPECT_FLOAT_EQ(sequence->get_cumulative_log_prob(), sum);
+}
+
+// The parallel samples of a request share one logit processor. Each must still see the request's generated length,
+// so the stop token stays masked for all of them until min_new_tokens tokens are generated.
+TEST(SamplerMinNewTokens, masks_stop_token_for_every_parallel_sample) {
+    GenerationConfig config;
+    config.max_new_tokens = 10;
+    config.do_sample = true;
+    config.top_k = 1;
+    config.num_return_sequences = 3;
+    config.min_new_tokens = 3;
+    config.stop_token_ids = {4};
+    std::vector<int64_t> input_vector{0, 1, 2, 3, 4};
+    ov::Tensor input_tensor(ov::element::i64, ov::Shape{1, 5}, input_vector.data());
+    auto group = std::make_shared<SequenceGroup>(0, input_tensor, config);
+    Sampler sampler;
+
+    group->schedule_tokens(input_vector.size());
+    group->set_output_seq_len(1);
+    std::vector<float> prompt_logits = {0, 5.f, 0, 0, 4.f};
+    sampler.sample({group}, ov::Tensor(ov::element::f32, ov::Shape{1, 1, 5}, prompt_logits.data()));
+    ASSERT_EQ(group->num_running_seqs(), 3);
+
+    for (size_t step = 0; step < 2; ++step) {
+        group->schedule_tokens(1);
+        std::vector<float> logits;
+        for (size_t sample = 0; sample < 3; ++sample) {
+            logits.insert(logits.end(), {0, 0, 4.f, 0, 5.f});
+        }
+        sampler.sample({group}, ov::Tensor(ov::element::f32, ov::Shape{3, 1, 5}, logits.data()));
+    }
+
+    for (const auto& sequence : group->get_sequences()) {
+        EXPECT_EQ(sequence->get_generated_ids(), (TokenIds{1, 2, 2}));
+    }
 }

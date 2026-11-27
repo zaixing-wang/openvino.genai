@@ -4,6 +4,7 @@
 #pragma once
 
 #include <future>
+#include <random>
 #include "openvino/genai/continuous_batching_pipeline.hpp"
 #include "continuous_batching/pipeline_impl.hpp"
 #include "openvino/genai/speculative_decoding/perf_metrics.hpp"
@@ -17,9 +18,7 @@ struct GenerateStrategy {
     std::function<void(size_t,
                        const ov::Tensor& in_ids,
                        GenerationConfig& main_cfg,
-                       GenerationConfig& draft_cfg,
-                       ov::Tensor& main_in,
-                       ov::Tensor& draft_in)> prepare_request;
+                       ov::Tensor& main_in)> prepare_request;
     std::function<void(const std::shared_ptr<ThreadedStreamerWrapper>&,
                        const std::vector<ov::Tensor>&,
                        const std::vector<GenerationConfig>&)> check_streaming;
@@ -33,7 +32,6 @@ std::vector<EncodedGenerationResult> generate_common(
     const std::vector<ov::Tensor>& input_ids,
     const std::vector<GenerationConfig>& sampling_params,
     const StreamerVariant& streamer,
-    std::optional<std::vector<ov::Tensor>> token_type_ids,
     std::optional<std::vector<std::pair<ov::Tensor, std::optional<int64_t>>>> position_ids,
     std::optional<std::vector<ov::Tensor>> prompt_ids,
     const std::optional<std::vector<std::unordered_map<std::string, ov::Tensor>>>& lm_extra_inputs_list,
@@ -68,13 +66,9 @@ std::vector<EncodedGenerationResult> generate_common(
     std::vector<GenerationHandle> main_generations;
     for (size_t rid = 0; rid < input_ids.size(); ++rid) {
         GenerationConfig main_cfg = sampling_params[rid];
-        GenerationConfig draft_cfg = main_cfg;
-        ov::Tensor main_in, draft_in;
-        strategy.prepare_request(rid, input_ids[rid],
-                                main_cfg, draft_cfg,
-                                main_in, draft_in);
+        ov::Tensor main_in;
+        strategy.prepare_request(rid, input_ids[rid], main_cfg, main_in);
 
-        const bool has_valid_token_type_ids = token_type_ids.has_value() && rid < token_type_ids->size();
         const bool has_valid_prompt_ids = prompt_ids.has_value() && rid < prompt_ids->size();
 
         if (position_ids.has_value() && self->m_inputs_embedder) {
@@ -90,7 +84,6 @@ std::vector<EncodedGenerationResult> generate_common(
             rid,
             main_in,
             main_cfg,
-            has_valid_token_type_ids ? std::make_optional((*token_type_ids)[rid]) : std::nullopt,
             has_valid_prompt_ids ? std::make_optional((*prompt_ids)[rid]) : std::nullopt,
             lm_extra_inputs_list.has_value() ? std::make_optional((*lm_extra_inputs_list)[rid]) : std::nullopt));
     }
@@ -158,6 +151,7 @@ std::vector<EncodedGenerationResult> generate_common(
         self->perf_metrics().raw_metrics.generate_durations.clear();
         self->perf_metrics().raw_metrics.generate_durations.emplace_back(generate_duration_us);
         self->perf_metrics().num_input_tokens = request->get_prompt_len();
+        self->perf_metrics().num_prefix_cache_hit_tokens = request->get_num_prefix_cache_hit_tokens();
         self->perf_metrics().evaluate_statistics(t_start);
 
         result.perf_metrics = self->perf_metrics();
@@ -168,6 +162,16 @@ std::vector<EncodedGenerationResult> generate_common(
     OPENVINO_ASSERT(results.size() == input_ids.size());
     return results;
 }
+
+namespace detail {
+inline constexpr uint32_t PROPOSAL_RNG_SEED_SALT = 0x9E3779B9U;
+
+// Seed of the draft copy of a request (make_draft_sampling_params). It differs from the main request's seed so that
+// the uniform draws accepting draft tokens are independent of the draws that proposed them.
+inline std::mt19937::result_type proposal_rng_seed(size_t generation_seed) {
+    return static_cast<std::mt19937::result_type>(generation_seed) ^ PROPOSAL_RNG_SEED_SALT;
+}
+}  // namespace detail
 
 class ContinuousBatchingPipeline::SpeculativeDecodingImpl : public ContinuousBatchingPipeline::IContinuousBatchingPipeline {
 protected:
@@ -187,6 +191,9 @@ protected:
     }
 
     static int64_t compute_rope_delta(const ov::Tensor& position_ids);
+    // The draft copy of a request never stops on its own, and it samples from a stream independent of the
+    // main request's, whose draws accept or reject the drafted tokens. A sampled draft requests no log-probs.
+    static GenerationConfig make_draft_sampling_params(const GenerationConfig& sampling_params);
     void drop_requests();
     virtual void align_request_pair_processed_prefix(uint64_t) {}
     virtual void validate_awaiting_requests(const std::vector<SequenceGroup::Ptr>& main_awaiting_requests,
@@ -203,7 +210,6 @@ public:
             const std::vector<ov::Tensor>& input_ids,
             const std::vector<GenerationConfig>& sampling_params,
             const StreamerVariant& streamer,
-            std::optional<std::vector<ov::Tensor>> token_type_ids,
             std::optional<std::vector<std::pair<ov::Tensor, std::optional<int64_t>>>> position_ids,
             std::optional<std::vector<ov::Tensor>> prompt_ids,
             const std::optional<std::vector<std::unordered_map<std::string, ov::Tensor>>>& lm_extra_inputs_list,
@@ -215,12 +221,15 @@ public:
     GenerationHandle add_request(uint64_t request_id,
                                  const ov::Tensor& input_ids,
                                  const ov::genai::GenerationConfig& sampling_params,
-                                 std::optional<ov::Tensor> token_type_ids = std::nullopt,
                                  std::optional<ov::Tensor> prompt_ids = std::nullopt,
                                  std::optional<std::unordered_map<std::string, ov::Tensor>> lm_extra_inputs = std::nullopt) override;
     GenerationHandle add_request(uint64_t request_id,
                                  const std::string& prompt,
                                  const ov::genai::GenerationConfig& sampling_params) override;
+
+    std::optional<AdapterConfig> get_pipeline_adapters() const override {
+        return m_main_pipeline->get_pipeline_adapters();
+    }
 
     bool has_non_finished_requests() override;
 
@@ -230,7 +239,6 @@ public:
     generate(const std::vector<ov::Tensor>& input_ids,
              const std::vector<GenerationConfig>& sampling_params,
              const StreamerVariant& streamer,
-             const std::optional<std::vector<ov::Tensor>>& token_type_ids = std::nullopt,
              const std::optional<std::vector<std::pair<ov::Tensor, std::optional<int64_t>>>>& position_ids = std::nullopt,
              const std::optional<std::vector<ov::Tensor>>& prompt_ids = std::nullopt,
              const std::optional<std::vector<std::unordered_map<std::string, ov::Tensor>>>& lm_extra_inputs_list = std::nullopt) override;

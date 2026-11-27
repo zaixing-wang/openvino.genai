@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "openvino/core/any.hpp"
@@ -25,11 +26,13 @@
 namespace ov::genai {
 
 /**
- * @brief Public Qwen3-Omni pipeline supporting text + speech outputs.
+ * @brief Public omni pipeline supporting text + speech outputs (Qwen3-Omni, LFM3-Omni).
  *
- * OmniPipeline composes a VLM pipeline (text generation with hidden-state collection)
- * with a Qwen3-Omni speech pipeline (Talker + CodePredictor + Code2Wav). Each call to
- * `generate` takes two configs:
+ * For Qwen3-Omni, OmniPipeline composes a VLM pipeline (text generation with hidden-state
+ * collection) with a Qwen3-Omni speech pipeline (Talker + CodePredictor + Code2Wav). LFM3-Omni
+ * has no separate talker: its language model emits text and speech frames in one stream, so
+ * speech is decoded inside the VLM (SDPA backend) and `get_talker()` returns nullptr.
+ * Each call to `generate` takes two configs:
  *
  *   - `GenerationConfig text_config`     — drives the thinker text decode
  *     (max_new_tokens, do_sample, temperature, top_p, top_k, repetition_penalty,
@@ -47,8 +50,9 @@ namespace ov::genai {
  *   - Pure-DI: takes pre-built VLM and talker components for independent device choices
  *              or a custom TalkerBase subclass.
  *
- * Both ctors enforce that the loaded model is Qwen3-Omni capable (model_type == QWEN3_OMNI
- * and enable_audio_output) — non-Omni models throw at construction time.
+ * The DI ctor enforces that the loaded model is Qwen3-Omni capable (model_type == QWEN3_OMNI
+ * and enable_audio_output); the path ctor also accepts LFM3-Omni. Other models throw at
+ * construction time.
  *
  * @note This is a preview API and is subject to change.
  */
@@ -58,6 +62,9 @@ public:
     /// `models_path`, both compiled to `device` with the same `properties`. Equivalent to
     /// constructing a `VLMPipeline(models_path, device, properties)` plus a
     /// `Talker(models_path, device, properties)` and passing them to the DI ctor.
+    /// For LFM3-Omni it loads only the VLM. It selects ATTENTION_BACKEND=SDPA unless the property is set,
+    /// because speech output needs SDPA. With PA, generate() supports text output only and throws if
+    /// return_audio is true.
     OmniPipeline(const std::filesystem::path& models_path,
                  const std::string& device,
                  const ov::AnyMap& properties = {});
@@ -74,9 +81,12 @@ public:
 
     /// @brief Generate text + (optionally) speech from a flat prompt.
     /// @param prompt The user prompt.
-    /// @param images Image tensors to be prepended to the prompt.
-    /// @param videos Video tensors to be prepended to the prompt.
-    /// @param audios Audio tensors to be prepended to the prompt.
+    /// @param images Image tensors. Place them with `<ov_genai_image_N>`; prepended if untagged.
+    /// @param videos Video tensors. Place them with `<ov_genai_video_N>`; prepended if untagged.
+    /// @param audios Audio tensors. Place them with `<ov_genai_audio_N>`; prepended if untagged,
+    ///        which is the recommended form since the model is trained with media before text.
+    ///        In a chat, N is conversation-absolute: a second turn that adds one audio uses
+    ///        `<ov_genai_audio_1>`, not `<ov_genai_audio_0>`.
     /// @param text_generation_config Thinker text-decode config.
     /// @param talker_speech_config Talker + speech-output config.
     /// @param streamer Optional streamer for text tokens.
@@ -191,6 +201,7 @@ public:
 
     /// @brief Return the underlying TalkerBase. Speaker enumeration and embedding retrieval
     /// live here: `get_talker()->list_speakers()`, `get_talker()->get_speaker_embedding(name)`.
+    /// nullptr for LFM3-Omni, which has no separate talker.
     std::shared_ptr<TalkerBase> get_talker() const;
 
 private:
@@ -202,6 +213,10 @@ private:
 /// `images`, `videos`, `audios` are reused from `openvino/genai/visual_language/pipeline.hpp`.
 static constexpr ov::Property<GenerationConfig> text_config{"text_config"};
 static constexpr ov::Property<OmniTalkerSpeechConfig> talker_speech_config{"talker_speech_config"};
-static constexpr ov::Property<OmniSpeechStreamerVariant> speech_streamer{"speech_streamer"};
+
+/// @brief `speech_streamer` key for the property bags above. A free function rather than an
+/// ov::Property because, like ov::genai::streamer, it stores the concrete variant alternative
+/// instead of the variant itself — that is what lets readers type-test the ov::Any.
+OPENVINO_GENAI_EXPORTS std::pair<std::string, Any> speech_streamer(OmniSpeechStreamerVariant func);
 
 }  // namespace ov::genai

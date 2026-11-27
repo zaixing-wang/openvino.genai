@@ -22,8 +22,14 @@ bool are_tokenizers_equal(Tokenizer& lhs, Tokenizer& rhs) {
     
     ov::Shape shape_lhs = encoded_string_lhs.get_shape(),
               shape_rhs = encoded_string_rhs.get_shape();
+    if (shape_lhs != shape_rhs) {
+        return false;
+    }
+    const int64_t* ids_lhs = encoded_string_lhs.data<const int64_t>();
+    const int64_t* ids_rhs = encoded_string_rhs.data<const int64_t>();
 
-    return shape_lhs == shape_rhs && lhs.get_eos_token_id() == rhs.get_eos_token_id() &&
+    return std::equal(ids_lhs, ids_lhs + encoded_string_lhs.get_size(), ids_rhs) &&
+           lhs.get_eos_token_id() == rhs.get_eos_token_id() &&
            lhs.get_bos_token_id() == rhs.get_bos_token_id() && lhs.get_pad_token_id() == rhs.get_pad_token_id();
 }
 
@@ -40,6 +46,22 @@ int64_t ContinuousBatchingPipeline::SpeculativeDecodingImpl::compute_rope_delta(
     const int64_t* data = position_ids.data<const int64_t>();
     const int64_t max_position_id = *std::max_element(data, data + position_ids.get_size());
     return max_position_id + 1 - static_cast<int64_t>(shape[seq_axis]);
+}
+
+GenerationConfig ContinuousBatchingPipeline::SpeculativeDecodingImpl::make_draft_sampling_params(
+    const GenerationConfig& sampling_params) {
+    GenerationConfig draft_sampling_params = sampling_params;
+    draft_sampling_params.ignore_eos = true;
+    draft_sampling_params.stop_strings = {};
+    draft_sampling_params.rng_seed = detail::proposal_rng_seed(sampling_params.rng_seed);
+    // Log-probs move the row to a candidate list, so without top-k or top-p truncation a recorded proposal would pair
+    // every token id with its probability instead of holding a dense row, and the draft would compute a full-vocabulary
+    // log-sum-exp per token. The main model reports the log-probs of accepted tokens. A greedy draft keeps them:
+    // without log-probs its tokens report log-prob 0, which assistant_confidence_threshold treats as unconfident.
+    if (draft_sampling_params.is_multinomial()) {
+        draft_sampling_params.logprobs = 0;
+    }
+    return draft_sampling_params;
 }
 
 std::pair<ov::genai::SchedulerConfig, ov::genai::SchedulerConfig>
@@ -147,20 +169,16 @@ GenerationHandle
 ContinuousBatchingPipeline::SpeculativeDecodingImpl::add_request(uint64_t request_id,
                                                                  const ov::Tensor& input_ids,
                                                                  const ov::genai::GenerationConfig& sampling_params,
-                                                                 std::optional<ov::Tensor> token_type_ids,
                                                                  std::optional<ov::Tensor> prompt_ids,
                                                                  std::optional<std::unordered_map<std::string, ov::Tensor>> lm_extra_inputs) {
     std::lock_guard<std::mutex> lock(m_draft_generations_mutex);
-    auto draft_sampling_params = sampling_params;
-    draft_sampling_params.ignore_eos = true;
-    draft_sampling_params.stop_strings = {};
+    const auto draft_sampling_params = make_draft_sampling_params(sampling_params);
     // The speculative draft path only uses language-model inputs. Multimodal auxiliary inputs such as
     // deepstack/visual tensors are consumed only by the main model, so lm_extra_inputs are not forwarded here.
-    m_draft_generations.insert({request_id, m_draft_pipeline->add_request(request_id, input_ids, draft_sampling_params, token_type_ids, prompt_ids)});
+    m_draft_generations.insert({request_id, m_draft_pipeline->add_request(request_id, input_ids, draft_sampling_params, prompt_ids)});
     return m_main_pipeline->add_request(request_id,
                                         input_ids,
                                         sampling_params,
-                                        token_type_ids,
                                         prompt_ids,
                                         lm_extra_inputs);
 }
@@ -170,9 +188,7 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::add_request(uint64_t reques
                                                                  const std::string& prompt,
                                                                  const ov::genai::GenerationConfig& sampling_params) {
     std::lock_guard<std::mutex> lock(m_draft_generations_mutex);
-    auto draft_sampling_params = sampling_params;
-    draft_sampling_params.ignore_eos = true;
-    draft_sampling_params.stop_strings = {};
+    const auto draft_sampling_params = make_draft_sampling_params(sampling_params);
     m_draft_generations.insert({request_id, m_draft_pipeline->add_request(request_id, prompt, draft_sampling_params)});
     return m_main_pipeline->add_request(request_id, prompt, sampling_params);
 }
@@ -198,113 +214,149 @@ void ContinuousBatchingPipeline::SpeculativeDecodingImpl::step() {
     // this blocks adding new requests during step as it may break coherence between main and draft models
     std::lock_guard<std::mutex> lock{m_draft_generations_mutex};
 
-    auto& raw_perf_counters = m_perf_metrics.raw_metrics;
-    auto& main_raw_perf_counters = m_perf_metrics.main_model_metrics.raw_metrics;
+    try {
+        auto& raw_perf_counters = m_perf_metrics.raw_metrics;
+        auto& main_raw_perf_counters = m_perf_metrics.main_model_metrics.raw_metrics;
 
-    const auto step_start = std::chrono::steady_clock::now();
+        const auto step_start = std::chrono::steady_clock::now();
 
-    m_draft_pipeline->pull_awaiting_requests(true);
-    m_main_pipeline->pull_awaiting_requests();
+        m_draft_pipeline->pull_awaiting_requests(true);
+        m_main_pipeline->pull_awaiting_requests();
 
-    // generate candidates by draft model
-    const auto draft_start = std::chrono::steady_clock::now();
-    m_draft_pipeline->multistep();
-    const auto draft_end = std::chrono::steady_clock::now();
-    m_sd_metrics.draft_duration += PerfMetrics::get_microsec(draft_end - draft_start) / 1e6;
-    m_pipeline_metrics = m_main_pipeline->get_metrics();
+        // generate candidates by draft model
+        const auto draft_start = std::chrono::steady_clock::now();
+        m_draft_pipeline->multistep();
+        const auto draft_end = std::chrono::steady_clock::now();
+        m_sd_metrics.draft_duration += PerfMetrics::get_microsec(draft_end - draft_start) / 1e6;
+        m_pipeline_metrics = m_main_pipeline->get_metrics();
 
-    // to generate num_matches statistic
-    std::map<int64_t, UpdateRequestResult> update_sequence_info;
-    // put candidates to model KV cache
-    auto draft_generated_requests = m_draft_pipeline->get_generated_requests();
-    for (const auto& candidate : m_draft_pipeline->get_generated_requests()) {
-        auto update_result = m_main_pipeline->update_request(candidate.first, candidate.second, false);
-        update_sequence_info.insert({{candidate.first, update_result}});
-    }
-    m_main_pipeline->sync_generated_embeddings();
-
-    // to ensure extras steps, if any, are finished before main model generation
-    if (m_sync_future.valid()) {
-        m_sync_future.get();
-    }
-
-    const auto main_start = std::chrono::steady_clock::now();
-    m_main_pipeline->step();
-    const auto main_end = std::chrono::steady_clock::now();
-    const auto main_duration = PerfMetrics::get_microsec(main_end - main_start);
-    m_sd_metrics.main_duration += main_duration / 1e6;
-    m_pipeline_metrics = m_main_pipeline->get_metrics();
-
-    auto main_generated_requests = m_main_pipeline->get_generated_requests();
-    for (const auto& checked_sequence : main_generated_requests) {
-        auto update_result = m_draft_pipeline->update_request(checked_sequence.first, checked_sequence.second, true);
-        const bool is_tree_validation = std::any_of(checked_sequence.second.begin(),
-                                                    checked_sequence.second.end(),
-                                                    [](const auto& sequence) {
-                                                        return sequence.second.tree_metadata != nullptr;
-                                                    });
-        if (is_tree_validation && update_result.removed_tokens_cnt > 0) {
-            --update_result.removed_tokens_cnt;
+        // to generate num_matches statistic
+        std::map<int64_t, UpdateRequestResult> update_sequence_info;
+        // put candidates to model KV cache
+        auto draft_generated_requests = m_draft_pipeline->get_generated_requests();
+        for (const auto& candidate : draft_generated_requests) {
+            auto update_result = m_main_pipeline->update_request(candidate.first, candidate.second, false);
+            update_sequence_info.insert({{candidate.first, update_result}});
         }
-        update_sequence_info[checked_sequence.first].removed_tokens_cnt = update_result.removed_tokens_cnt;
-    }
-    m_draft_pipeline->sync_generated_embeddings();
+        m_main_pipeline->sync_generated_embeddings();
 
-    // finish draft request if the generation was completed
-    for (const auto& draft_request : draft_generated_requests) {
-        auto request_id = draft_request.first;
-        if (!main_generated_requests.count(request_id)) {
+        // to ensure extras steps, if any, are finished before main model generation
+        if (m_sync_future.valid()) {
+            m_sync_future.get();
+        }
+
+        const auto main_start = std::chrono::steady_clock::now();
+        m_main_pipeline->step();
+        const auto main_end = std::chrono::steady_clock::now();
+        const auto main_duration = PerfMetrics::get_microsec(main_end - main_start);
+        m_sd_metrics.main_duration += main_duration / 1e6;
+        m_pipeline_metrics = m_main_pipeline->get_metrics();
+
+        auto main_generated_requests = m_main_pipeline->get_generated_requests();
+        for (const auto& checked_sequence : main_generated_requests) {
+            auto update_result =
+                m_draft_pipeline->update_request(checked_sequence.first, checked_sequence.second, true);
+            const bool is_tree_validation =
+                std::any_of(checked_sequence.second.begin(), checked_sequence.second.end(), [](const auto& sequence) {
+                    return sequence.second.tree_metadata != nullptr;
+                });
+            if (is_tree_validation && update_result.removed_tokens_cnt > 0) {
+                --update_result.removed_tokens_cnt;
+            }
+            update_sequence_info[checked_sequence.first].removed_tokens_cnt = update_result.removed_tokens_cnt;
+        }
+        m_draft_pipeline->sync_generated_embeddings();
+
+        // The main request continues alone when its draft request ended: the draft pipeline ran out of KV cache
+        // (IGNORED, logged here) or stopped the request itself (STOP, logged where it stopped; only a DFlash window
+        // that could not run). A handle is dropped only after its request ended, since dropping it stops the request.
+        // An ended draft request is no longer among the draft's generated requests, so it is dropped here even when
+        // the main request finished in this step.
+        for (auto draft_it = m_draft_generations.begin(); draft_it != m_draft_generations.end();) {
+            const uint64_t request_id = draft_it->first;
+            const GenerationStatus draft_status = draft_it->second->get_status();
+            if (draft_status != GenerationStatus::IGNORED && draft_status != GenerationStatus::STOP) {
+                ++draft_it;
+                continue;
+            }
+            if (draft_status == GenerationStatus::IGNORED && main_generated_requests.count(request_id)) {
+                GENAI_WARN("Request %llu: the draft model ran out of KV cache; continuing without speculative decoding.",
+                           static_cast<unsigned long long>(request_id));
+            }
             m_draft_pipeline->finish_request(request_id);
-            // remove draft_generation_handle from queue
-            m_draft_generations.erase(request_id);
+            draft_it = m_draft_generations.erase(draft_it);
         }
-        auto updated_seq_info = update_sequence_info[request_id];
-        m_sd_metrics.update_draft_generated_len(request_id, updated_seq_info.inserted_tokens_cnt);
 
-        // Prompt phase or draft-only update without main-model validation.
-        if (updated_seq_info.inserted_tokens_cnt == 0 || !main_generated_requests.count(request_id)) {
-            continue;
+        // finish draft request if the generation was completed
+        for (const auto& draft_request : draft_generated_requests) {
+            auto request_id = draft_request.first;
+            if (!main_generated_requests.count(request_id)) {
+                m_draft_pipeline->finish_request(request_id);
+                // remove draft_generation_handle from queue
+                m_draft_generations.erase(request_id);
+            }
+            auto updated_seq_info = update_sequence_info[request_id];
+            m_sd_metrics.update_draft_generated_len(request_id, updated_seq_info.inserted_tokens_cnt);
+
+            // Prompt phase or draft-only update without main-model validation.
+            if (updated_seq_info.inserted_tokens_cnt == 0 || !main_generated_requests.count(request_id)) {
+                continue;
+            }
+            OPENVINO_ASSERT(updated_seq_info.inserted_tokens_cnt >= updated_seq_info.removed_tokens_cnt,
+                            "Speculative decoding removed more draft tokens than were inserted.");
+            m_perf_metrics.num_draft_tokens += updated_seq_info.inserted_tokens_cnt;
+            m_perf_metrics.num_accepted_tokens +=
+                updated_seq_info.inserted_tokens_cnt - updated_seq_info.removed_tokens_cnt;
+            float acceptance_rate =
+                1 - static_cast<float>(updated_seq_info.removed_tokens_cnt) / updated_seq_info.inserted_tokens_cnt;
+            m_sd_metrics.update_acceptance_rate(request_id, acceptance_rate * 100);
+            m_sd_metrics.update_draft_accepted_tokens(
+                request_id,
+                (updated_seq_info.inserted_tokens_cnt - updated_seq_info.removed_tokens_cnt));
         }
-        OPENVINO_ASSERT(updated_seq_info.inserted_tokens_cnt >= updated_seq_info.removed_tokens_cnt,
-                        "Speculative decoding removed more draft tokens than were inserted.");
-        m_perf_metrics.num_draft_tokens += updated_seq_info.inserted_tokens_cnt;
-        m_perf_metrics.num_accepted_tokens += updated_seq_info.inserted_tokens_cnt - updated_seq_info.removed_tokens_cnt;
-        float acceptance_rate = 1 - static_cast<float>(updated_seq_info.removed_tokens_cnt) / updated_seq_info.inserted_tokens_cnt;
-        m_sd_metrics.update_acceptance_rate(request_id, acceptance_rate * 100);
-        m_sd_metrics.update_draft_accepted_tokens(request_id, (updated_seq_info.inserted_tokens_cnt - updated_seq_info.removed_tokens_cnt));
-    }
 
-    const auto step_end = std::chrono::steady_clock::now();
-    const auto step_microsec_duration = PerfMetrics::get_microsec(step_end - step_start);
+        const auto step_end = std::chrono::steady_clock::now();
+        const auto step_microsec_duration = PerfMetrics::get_microsec(step_end - step_start);
 
-    // update perf metrics
-    const auto num_generated_tokens = m_main_pipeline->get_processed_tokens_per_iteration();
-    if (num_generated_tokens > 0) {
-        raw_perf_counters.m_token_infer_durations.emplace_back(step_microsec_duration);
-        raw_perf_counters.m_inference_durations[0] += MicroSeconds(step_microsec_duration);
-        raw_perf_counters.m_new_token_times.emplace_back(main_end);
-        raw_perf_counters.m_batch_sizes.emplace_back(num_generated_tokens);
+        // update perf metrics
+        const auto num_generated_tokens = m_main_pipeline->get_processed_tokens_per_iteration();
+        if (num_generated_tokens > 0) {
+            raw_perf_counters.m_token_infer_durations.emplace_back(step_microsec_duration);
+            raw_perf_counters.m_inference_durations[0] += MicroSeconds(step_microsec_duration);
+            raw_perf_counters.m_new_token_times.emplace_back(main_end);
+            raw_perf_counters.m_batch_sizes.emplace_back(num_generated_tokens);
 
-        auto m_main_pipeline_metrics = m_main_pipeline->get_metrics();
-        main_raw_perf_counters.m_durations.push_back(MicroSeconds(main_duration));
-        main_raw_perf_counters.m_inference_durations[0] += MicroSeconds(m_main_pipeline_metrics.inference_duration);
-        main_raw_perf_counters.m_batch_sizes.push_back(num_generated_tokens); // or should be processed + generated
-        m_sd_metrics.update_generated_len(num_generated_tokens);
-    }
+            auto m_main_pipeline_metrics = m_main_pipeline->get_metrics();
+            main_raw_perf_counters.m_durations.push_back(MicroSeconds(main_duration));
+            main_raw_perf_counters.m_inference_durations[0] += MicroSeconds(m_main_pipeline_metrics.inference_duration);
+            main_raw_perf_counters.m_batch_sizes.push_back(num_generated_tokens);  // or should be processed + generated
+            m_sd_metrics.update_generated_len(num_generated_tokens);
+        }
 
-    if (main_generated_requests.empty() && utils::env_setup_for_print_debug_info()) {
-        m_sd_metrics.print(true);
-        m_sd_metrics.clean_up();
+        if (main_generated_requests.empty() && utils::env_setup_for_print_debug_info()) {
+            m_sd_metrics.print(true);
+            m_sd_metrics.clean_up();
+        }
+    } catch (...) {
+        const std::exception_ptr error = std::current_exception();
+        if (m_sync_future.valid()) {
+            try {
+                m_sync_future.get();
+            } catch (...) {
+                // Preserve the failure that entered this cleanup path.
+            }
+        }
+        m_main_pipeline->fail_pipeline(error);
+        m_draft_pipeline->fail_pipeline(error);
+        m_draft_generations.clear();
+        std::rethrow_exception(error);
     }
 }
-
-
 
 std::vector<EncodedGenerationResult>
 ContinuousBatchingPipeline::SpeculativeDecodingImpl::generate(const std::vector<ov::Tensor>& input_ids,
                                                               const std::vector<GenerationConfig>& sampling_params,
                                                               const StreamerVariant& streamer,
-                                                              const std::optional<std::vector<ov::Tensor>>& token_type_ids,
                                                               const std::optional<std::vector<std::pair<ov::Tensor, std::optional<int64_t>>>>& position_ids,
                                                               const std::optional<std::vector<ov::Tensor>>& prompt_ids,
                                                               const std::optional<std::vector<std::unordered_map<std::string, ov::Tensor>>>& lm_extra_inputs_list) {
@@ -312,18 +364,13 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::generate(const std::vector<
     strategy.prepare_request = [this](size_t,
                                   const ov::Tensor& in_ids,
                                   GenerationConfig& main_cfg,
-                                  GenerationConfig& draft_cfg,
-                                  ov::Tensor& main_in,
-                                  ov::Tensor& draft_in) {
+                                  ov::Tensor& main_in) {
         if (main_cfg.assistant_confidence_threshold == 0.f) {
             if (!main_cfg.num_assistant_tokens.has_value() || main_cfg.num_assistant_tokens.value() == 0) {
                 main_cfg.num_assistant_tokens = m_main_pipeline->default_num_assistant_tokens;
             }
         }
-        draft_cfg.ignore_eos = true;
-        draft_cfg.stop_strings = {};
         main_in = in_ids;
-        draft_in = in_ids;
     };
     strategy.check_streaming = [](const std::shared_ptr<ThreadedStreamerWrapper>& streamer_ptr,
                                   const std::vector<ov::Tensor>& input_ids,
@@ -338,7 +385,7 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::generate(const std::vector<
         return PerfMetrics::get_microsec(std::chrono::steady_clock::now() - start);
     };
 
-    return generate_common(this, input_ids, sampling_params, streamer, token_type_ids, position_ids, prompt_ids, lm_extra_inputs_list, strategy);
+    return generate_common(this, input_ids, sampling_params, streamer, position_ids, prompt_ids, lm_extra_inputs_list, strategy);
 }
 
 SpeculativeDecodingMetrics

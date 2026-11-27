@@ -15,6 +15,7 @@ from llm_bench_utils.tts_utils import (
     SPEECHT5_SPEAKER_EMB_SHAPE,
     KOKORO_SPEAKER_EMB_SHAPE,
     is_kokoro_model_id,
+    get_qwen3_tts_variant,
 )
 from urllib.parse import urlparse
 
@@ -56,15 +57,21 @@ def get_param_from_file(args, input_key):
                     else:
                         raise RuntimeError(f'== {input_key} path should not be empty string ==')
         else:
-            if args["use_case"].task not in ["visual_text_gen", "image_gen", "video_gen", "text_embed"]:
+            if args["use_case"].task not in [
+                "visual_text_gen",
+                "visual_text_gen_chat",
+                "image_gen",
+                "video_gen",
+                "text_embed",
+            ]:
                 raise RuntimeError(
                     "Multiple sources for benchmarking supported for Visual Language Models / Image To Image Models / Inpainting Models / Multimodal Embeddings"
                 )
             data_dict = {}
             if "media" in input_key:
                 if args["media"] is None and args["images"] is None:
-                    if args["use_case"].task == "visual_text_gen":
-                        if args["video"] is None:
+                    if args["use_case"].task in ["visual_text_gen", "visual_text_gen_chat"]:
+                        if args["video"] is None and args["media"] is None:
                             log.warn("Input image/video is not provided. Only text generation part will be evaluated")
                     elif args["use_case"].task == "text_embed":
                         pass
@@ -76,7 +83,7 @@ def get_param_from_file(args, input_key):
                 data_dict["video"] = args["video"]
 
             if args["prompt"] is None:
-                if args["use_case"].task == "visual_text_gen":
+                if args["use_case"].task in ["visual_text_gen", "visual_text_gen_chat"]:
                     data_dict["prompt"] = "What is OpenVINO?" if data_dict.get("media") is None else "Describe image"
                 elif args["use_case"].task == "image_gen":
                     data_dict["prompt"] = "sailing ship in storm by Leonardo da Vinci"
@@ -146,12 +153,59 @@ def set_default_param_for_ov_config(ov_config):
 
 TASK_ALIASES = {"embed": "text_embed"}
 
+# Role in --dataset_column -> key in the prompt dict used by llm_bench (see parse_vlm_json_data)
+DATASET_COLUMN_ROLES = {"text": "prompt", "image": "media"}
+
+
+def parse_dataset_columns(columns):
+    # Plain names are assigned by position (text, image), 'role=name' items are assigned by role.
+    roles = list(DATASET_COLUMN_ROLES)
+    if len(columns) > len(roles):
+        raise RuntimeError(f"--dataset_column accepts up to {len(roles)} columns ({', '.join(roles)}), got {columns}")
+    parsed = {}
+    for position, item in enumerate(columns):
+        role, sep, name = item.partition("=")
+        if not sep:
+            role, name = roles[position], item
+        if role not in DATASET_COLUMN_ROLES:
+            raise RuntimeError(
+                f"Unknown role '{role}' in --dataset_column '{item}', expected one of: {', '.join(roles)}"
+            )
+        if not name:
+            raise RuntimeError(f"Empty column name in --dataset_column '{item}'")
+        parsed[DATASET_COLUMN_ROLES[role]] = name
+    if "prompt" not in parsed:
+        raise RuntimeError(f"--dataset_column must contain a text column, got {columns}")
+    return parsed
+
+
+MODEL_TYPE_ON_TASK_MAPPING = {
+    "text": "text_gen",
+    "text-chat": "text_gen_chat",
+    "visual-text": "visual_text_gen",
+    "text-to-image": "text-to-image",
+    "text-to-video": "text-to-video",
+    "image-to-video": "image-to-video",
+    "speech-generation": "text_to_speech",
+    "visual-text-chat": "visual_text_gen_chat",
+    "image-inpainting": "inpainting",
+    "embedding": "text_embed",
+    "text-reranking": "text_rerank",
+    "speech-recognition": "speech_to_text",
+}
+
 
 def analyze_args(args):
     args.task = TASK_ALIASES.get(args.task, args.task)
     model_args = {}
     model_args['prompt'] = args.prompt
     model_args['prompt_file'] = args.prompt_file
+    model_args["dataset"] = args.dataset
+    model_args["dataset_subset"] = args.dataset_subset
+    model_args["dataset_split"] = args.dataset_split
+    model_args["dataset_columns"] = parse_dataset_columns(args.dataset_column) if args.dataset is not None else None
+    model_args["dataset_samples"] = args.dataset_samples
+    model_args["dataset_seed"] = args.dataset_seed
     model_args['infer_count'] = args.infer_count
     model_args["num_steps"] = args.num_steps
     model_args["height"] = args.height
@@ -167,15 +221,19 @@ def analyze_args(args):
     model_args['torch_compile_options'] = args.torch_compile_options
     model_args['torch_compile_input_module'] = args.torch_compile_input_module
     model_args['media'] = args.media
-    model_args["disable_prompt_permutation"] = args.disable_prompt_permutation
     model_args["static_reshape"] = args.static_reshape
     model_args["num_frames"] = args.num_frames
     model_args["frame_rate"] = args.frame_rate
     model_args["negative_prompt"] = args.negative_prompt
     model_args["mask_image"] = args.mask_image
-    model_args["task"] = args.task
+    model_args["task"] = (
+        MODEL_TYPE_ON_TASK_MAPPING.get(args.model_type, args.model_type) if args.model_type else args.task
+    )
     model_args["speech_language"] = args.speech_language
     model_args["speech_voice"] = args.speech_voice
+    model_args["speech_instruct"] = args.speech_instruct
+    model_args["speech_ref_audio"] = args.speech_ref_audio
+    model_args["speech_ref_text"] = args.speech_ref_text
     model_args["strength"] = args.strength
     model_args["emb_pooling_type"] = args.embedding_pooling
     model_args["emb_normalize"] = args.embedding_normalize
@@ -235,39 +293,68 @@ def analyze_args(args):
     if model_framework in ('ov', 'pt'):
         from llm_bench_utils.get_use_case import get_use_case
 
-        use_case, model_type, model_name = get_use_case(Path(args.model), args.task)
+        use_case, model_type, model_name = get_use_case(Path(args.model), model_args["task"])
         use_case.model_type = model_type
     model_args["use_case"] = use_case
     model_args["model_type"] = model_type
     model_args["is_kokoro_model"] = use_case.task == "text_to_speech" and is_kokoro_model_id(model_path)
     model_args["is_omni_model"] = isinstance(model_type, str) and model_type.startswith("qwen3-omni")
+    model_args["qwen3_tts_variant"] = get_qwen3_tts_variant(model_path) if use_case.task == "text_to_speech" else None
+    model_args["is_qwen3_tts_model"] = (
+        use_case.task == "text_to_speech" and isinstance(model_type, str) and model_type.startswith("qwen3-tts")
+    )
+    if args.dataset is not None:
+        if use_case.task not in ["text_gen", "visual_text_gen"]:
+            raise RuntimeError(
+                f"--dataset is supported only for text_gen and visual_text_gen tasks, got {use_case.task}"
+            )
+        if use_case.task == "text_gen" and len(model_args["dataset_columns"]) > 1:
+            raise RuntimeError(
+                f"Image dataset columns are supported only for visual_text_gen task, got {args.dataset_column}"
+            )
+        conflicting_args = [
+            name for name in ["prompt", "prompt_file", "media", "images", "video"] if getattr(args, name) is not None
+        ]
+        if conflicting_args:
+            raise RuntimeError(f"--dataset can not be used together with: {', '.join(conflicting_args)}")
     if use_case.task == "code_gen" and not model_args["prompt"] and not model_args["prompt_file"]:
         model_args["prompt"] = "def print_hello_world():"
     model_args["config"] = {}
-    if args.load_config is not None:
-        config = get_config(args.load_config)
+    # load_config was used previously, as part of the argument alignment moving to --ov_config
+    # support both for now
+    ov_config = args.ov_config if args.ov_config is not None else args.load_config
+    if ov_config is not None:
+        config = get_config(ov_config)
         if type(config) is dict and len(config) > 0:
             model_args["config"] = config
     if model_framework == "ov":
         set_default_param_for_ov_config(model_args["config"])
-        if "ATTENTION_BACKEND" not in model_args["config"] and not optimum and args.device != "NPU":
-            if use_case.task in ["text_gen", "visual_text_gen"]:
+        if "ATTENTION_BACKEND" not in model_args["config"] and not optimum and args.device.upper() != "NPU":
+            if use_case.task in ["text_gen", "text_gen_chat", "visual_text_gen", "visual_text_gen_chat"]:
                 model_args["config"]["ATTENTION_BACKEND"] = PA_ATTENTION_BACKEND
         log.info(f"OV Config={model_args['config']}")
     elif model_framework == 'pt':
         log.info(f"PT Config={model_args['config']}")
     model_args['model_name'] = model_name
 
+    model_args["disable_prompt_permutation"] = args.disable_prompt_permutation
+    # prompt_permutation is designed to bypass the prefix-caching optimization in PA mode
+    # NPU does not support PA
+    if args.device.upper() == "NPU":
+        model_args["disable_prompt_permutation"] = True
+
     cb_config = None
     if args.cb_config:
         cb_config = get_config(args.cb_config)
     model_args["cb_config"] = cb_config
-    if args.draft_model:
-        if (args.draft_device != "NPU" and args.device != "NPU" and model_args['config']['ATTENTION_BACKEND'] != PA_ATTENTION_BACKEND):
-            log.warning("Speculative Decoding is supported only with Paged Attention Backend for non-NPU devices")
-            args.draft_model = None
     model_args['draft_model'] = args.draft_model
     model_args['draft_device'] = args.draft_device
+    model_args["draft_ov_config"] = {}
+    if args.draft_ov_config is not None:
+        draft_ov_config = get_config(args.draft_ov_config)
+        if type(draft_ov_config) is dict and len(draft_ov_config) > 0:
+            set_default_param_for_ov_config(draft_ov_config)
+            model_args["draft_ov_config"] = draft_ov_config
     draft_cb_config = None
     if args.draft_cb_config:
         draft_cb_config = get_config(args.draft_cb_config)
@@ -364,7 +451,10 @@ def resolve_media_file_path(file_path, prompt_file_path):
     if not file_path:
         return file_path
     if not (file_path.startswith("http://") or file_path.startswith("https://")):
-        return os.path.join(os.path.dirname(prompt_file_path), file_path.replace("./", ""))
+        media_file_path = Path(file_path)
+        if media_file_path.is_absolute():
+            return str(media_file_path.resolve())
+        return str((Path(prompt_file_path).parent / media_file_path).resolve())
     return file_path
 
 

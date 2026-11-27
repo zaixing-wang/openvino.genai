@@ -9,14 +9,14 @@ The preferred approach is to build both OpenVINO and OpenVINO GenAI from sources
 
 - [CMake](https://cmake.org/download/) 3.26 or higher
 - GCC 7.5 or higher
-- Python 3.10 or higher
+- Python 3.11 or higher
 - Git
 
 ### Windows
 
 - [CMake](https://cmake.org/download/) 3.26 or higher
 - Microsoft Visual Studio 2019 or higher, version 16.3 or later
-- Python 3.10 or higher
+- Python 3.11 or higher
 - Git for Windows
 
 ### macOS
@@ -30,7 +30,7 @@ The preferred approach is to build both OpenVINO and OpenVINO GenAI from sources
     ```sh
     xcode-select --install
     ```
-- Python 3.10 or higher
+- Python 3.11 or higher
 - Git
 
 
@@ -252,7 +252,7 @@ After setting up your environment, use the following commands to configure addit
     ```sh
     cmake -DENABLE_GIL_PYTHON_API=OFF -S ./ -B ./build/
     ```
-    This disables the Global Interpreter Lock (GIL) in the Python API, enabling free threading. Note that this feature is experimental and may not be fully supported in all environments.
+    This disables the Global Interpreter Lock (GIL) in the Python API, enabling free threading. Use it only with a free-threaded interpreter (Python 3.13t or 3.14t); keep the default `ON` for regular interpreters. Note that this feature is experimental and may not be fully supported in all environments.
 
 ### Install OpenVINO GenAI From Source
 

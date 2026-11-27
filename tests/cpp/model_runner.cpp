@@ -46,16 +46,16 @@ std::shared_ptr<ov::Model> create_dummy_la_paging_model() {
     return std::make_shared<ov::Model>(ov::OutputVector{logits}, params);
 }
 
-Scheduler::Output make_output_for_single_sequence(uint64_t seq_id,
+ContinuousBatchingScheduler::Output make_output_for_single_sequence(uint64_t seq_id,
                                                   size_t num_scheduled_tokens,
                                                   const BlocksPerLayer& la_blocks) {
-    Scheduler::Output out;
+    ContinuousBatchingScheduler::Output out;
     out.m_scheduled_sequence_groups_ids = {0};
     out.m_total_num_scheduled_tokens = num_scheduled_tokens;
 
     // ModelRunner expects one KV block table per decoder layer. Use a single layer for tests.
     out.set_kv_block_tables(seq_id, {BlocksPerLayer{std::make_shared<CacheBlock>(0)}});
-    Scheduler::Output::LinearAttentionPagingData paging_data;
+    ContinuousBatchingScheduler::Output::LinearAttentionPagingData paging_data;
     for (const auto& block : la_blocks) {
         paging_data.block_indices.push_back(static_cast<int32_t>(block->get_index()));
     }
@@ -63,17 +63,17 @@ Scheduler::Output make_output_for_single_sequence(uint64_t seq_id,
     return out;
 }
 
-Scheduler::Output make_output_for_sequences(
-    const std::vector<std::pair<uint64_t, Scheduler::Output::LinearAttentionPagingData>>& sequence_blocks,
+ContinuousBatchingScheduler::Output make_output_for_sequences(
+    const std::vector<std::pair<uint64_t, ContinuousBatchingScheduler::Output::LinearAttentionPagingData>>& sequence_blocks,
     size_t total_num_scheduled_tokens) {
-    Scheduler::Output out;
+    ContinuousBatchingScheduler::Output out;
     out.m_total_num_scheduled_tokens = total_num_scheduled_tokens;
 
     for (size_t group_idx = 0; group_idx < sequence_blocks.size(); ++group_idx) {
         const auto& [seq_id, paging_data] = sequence_blocks[group_idx];
         out.m_scheduled_sequence_groups_ids.push_back(group_idx);
         out.set_kv_block_tables(seq_id, {BlocksPerLayer{std::make_shared<CacheBlock>(0)}});
-        Scheduler::Output::LinearAttentionPagingData paging_data_copy = paging_data;
+        ContinuousBatchingScheduler::Output::LinearAttentionPagingData paging_data_copy = paging_data;
         out.set_linear_attention_paging_data(seq_id, std::move(paging_data_copy));
     }
 
@@ -113,7 +113,7 @@ TEST(TestModelRunnerLinearAttentionPaging, prefill_uses_read_plus_interval_write
             std::make_shared<CacheBlock>(10),
             std::make_shared<CacheBlock>(11),
             std::make_shared<CacheBlock>(12)});
-    Scheduler::Output::LinearAttentionPagingData paging_data = out.get_linear_attention_paging_data(seq_id);
+    ContinuousBatchingScheduler::Output::LinearAttentionPagingData paging_data = out.get_linear_attention_paging_data(seq_id);
     paging_data.cache_interval = 128;
     out.set_linear_attention_paging_data(seq_id, std::move(paging_data));
 
@@ -156,7 +156,7 @@ TEST(TestModelRunnerLinearAttentionPaging, generation_within_interval_reuses_wri
         BlocksPerLayer{
             std::make_shared<CacheBlock>(20),
             std::make_shared<CacheBlock>(21)});
-    Scheduler::Output::LinearAttentionPagingData paging_data;
+    ContinuousBatchingScheduler::Output::LinearAttentionPagingData paging_data;
     paging_data.block_indices = {20, 20};
     paging_data.past_length = 4;
     paging_data.cache_interval = 128;
@@ -204,8 +204,8 @@ TEST(TestModelRunnerLinearAttentionPaging, mixed_legacy_and_prefix_modes_can_sha
 
     auto out = make_output_for_sequences(
         {
-            {legacy_sequence->get_id(), Scheduler::Output::LinearAttentionPagingData{{30, 30}, 4, 0}},
-            {prefix_sequence->get_id(), Scheduler::Output::LinearAttentionPagingData{{40, 40}, 4, 128}}
+            {legacy_sequence->get_id(), ContinuousBatchingScheduler::Output::LinearAttentionPagingData{{30, 30}, 4, 0}},
+            {prefix_sequence->get_id(), ContinuousBatchingScheduler::Output::LinearAttentionPagingData{{40, 40}, 4, 128}}
         },
         /*total_num_scheduled_tokens=*/2);
 
@@ -222,4 +222,127 @@ TEST(TestModelRunnerLinearAttentionPaging, mixed_legacy_and_prefix_modes_can_sha
     EXPECT_EQ(tensor_to_i32_vector(la_begins), (std::vector<int32_t>{0, 2, 4}));
     EXPECT_EQ(tensor_to_i32_vector(la_past_lens), (std::vector<int32_t>{4, 4}));
     EXPECT_EQ(tensor_to_i32_vector(la_interval), (std::vector<int32_t>{0, 128}));
+}
+
+namespace {
+
+constexpr size_t DFLASH_HIDDEN_SIZE = 2;
+
+std::shared_ptr<ov::Model> create_dummy_dflash_draft_model() {
+    ov::ParameterVector params;
+    auto add_input = [&](const std::string& name, const ov::element::Type& type, const ov::PartialShape& pshape) {
+        auto p = std::make_shared<ov::op::v0::Parameter>(type, pshape);
+        p->output(0).get_tensor().set_names({name});
+        params.push_back(p);
+    };
+    add_input("input_ids", ov::element::i64, ov::PartialShape::dynamic(1));
+    add_input("position_ids", ov::element::i64, ov::PartialShape::dynamic(1));
+    add_input("past_lens", ov::element::i32, ov::PartialShape::dynamic(1));
+    add_input("subsequence_begins", ov::element::i32, ov::PartialShape::dynamic(1));
+    add_input("block_indices", ov::element::i32, ov::PartialShape::dynamic(1));
+    add_input("block_indices_begins", ov::element::i32, ov::PartialShape::dynamic(1));
+    add_input("max_context_len", ov::element::i32, ov::PartialShape{});
+    add_input("token_type_ids", ov::element::i64, ov::PartialShape{-1, 1});
+    add_input("hidden_states", ov::element::f32, ov::PartialShape{-1, 1, static_cast<int64_t>(DFLASH_HIDDEN_SIZE)});
+    add_input("sampled_tokens_indices", ov::element::i64, ov::PartialShape{-1});
+
+    auto logits = ov::op::v0::Constant::create(ov::element::f32, {1, 1, 8}, {0.0f});
+    logits->output(0).get_tensor().set_names({"logits"});
+    return std::make_shared<ov::Model>(ov::OutputVector{logits}, params);
+}
+
+// A draft group with seed 7 and 3 masks whose first `window_rows` positions are scheduled as one window.
+SequenceGroup::Ptr make_dflash_window_group(const std::vector<int64_t>& prompt_tokens,
+                                            size_t window_rows,
+                                            uint64_t request_id = 0) {
+    auto group = std::make_shared<SequenceGroup>(
+        request_id,
+        ov::Tensor(ov::element::i64, {prompt_tokens.size()}, const_cast<int64_t*>(prompt_tokens.data())),
+        utils::get_greedy_config());
+    for (int64_t token : {7, 99, 99, 99}) {
+        group->get_running_sequences()[0]->append_token(token, 0.0f);
+    }
+    group->schedule_tokens(window_rows);
+    return group;
+}
+
+ov::Tensor make_dflash_hidden_rows(size_t rows) {
+    ov::Tensor hidden(ov::element::f32, {rows, 1, DFLASH_HIDDEN_SIZE});
+    std::iota(hidden.data<float>(), hidden.data<float>() + hidden.get_size(), 1.0f);
+    return hidden;
+}
+
+template <typename T>
+std::vector<T> tensor_values(const ov::Tensor& tensor) {
+    const T* data = tensor.data<const T>();
+    return std::vector<T>(data, data + tensor.get_size());
+}
+
+}  // namespace
+
+TEST(TestModelRunnerDFlashDraft, deepspec_gathers_from_the_seed_row) {
+    ov::Core core;
+    ov::InferRequest request = core.compile_model(create_dummy_dflash_draft_model(), "CPU").create_infer_request();
+    ModelRunner runner(request, /*block_size=*/4, /*num_decoder_layers=*/1);
+    runner.enable_dflash_draft(/*candidate_position_offset=*/0);
+
+    // 8 target rows, then the block [seed, mask, mask]
+    const std::vector<int64_t> prompt_tokens = {0, 1, 2, 3, 4, 5, 6, 7};
+    auto group = make_dflash_window_group(prompt_tokens, 11);
+    runner.set_initial_hidden_state(0, make_dflash_hidden_rows(8));
+    const auto seq_id = group->get_running_sequences()[0]->get_id();
+    std::ignore = runner.forward({group}, make_output_for_single_sequence(seq_id, 11, BlocksPerLayer{std::make_shared<CacheBlock>(0)}));
+
+    EXPECT_EQ(tensor_values<int64_t>(runner.get_infer_request().get_tensor("sampled_tokens_indices")),
+              (std::vector<int64_t>{8, 9, 10}));
+}
+
+TEST(TestModelRunnerDFlashDraft, context_only_window_gathers_nothing) {
+    ov::Core core;
+    ov::InferRequest request = core.compile_model(create_dummy_dflash_draft_model(), "CPU").create_infer_request();
+    ModelRunner runner(request, /*block_size=*/4, /*num_decoder_layers=*/1);
+    runner.enable_dflash_draft(/*candidate_position_offset=*/1);
+
+    // a prefill chunk: only target rows, no block
+    const std::vector<int64_t> prompt_tokens = {0, 1, 2, 3, 4, 5, 6, 7};
+    auto group = make_dflash_window_group(prompt_tokens, 4);
+    runner.set_initial_hidden_state(0, make_dflash_hidden_rows(4));
+    const auto seq_id = group->get_running_sequences()[0]->get_id();
+    std::ignore = runner.forward({group}, make_output_for_single_sequence(seq_id, 4, BlocksPerLayer{std::make_shared<CacheBlock>(0)}));
+
+    EXPECT_EQ(tensor_values<int64_t>(runner.get_infer_request().get_tensor("token_type_ids")), (std::vector<int64_t>{0, 0, 0, 0}));
+    EXPECT_EQ(runner.get_infer_request().get_tensor("sampled_tokens_indices").get_size(), 0);
+    EXPECT_EQ(group->get_output_seq_len(), 0);
+}
+
+TEST(TestModelRunnerDFlashDraft, batched_windows_use_their_own_rows) {
+    ov::Core core;
+    ov::InferRequest request = core.compile_model(create_dummy_dflash_draft_model(), "CPU").create_infer_request();
+    ModelRunner runner(request, /*block_size=*/4, /*num_decoder_layers=*/1);
+    runner.enable_dflash_draft(/*candidate_position_offset=*/1);
+
+    // request 0: 8 target rows + block; request 1: 2 target rows + block, starting at batch row 12
+    const std::vector<int64_t> first_prompt = {0, 1, 2, 3, 4, 5, 6, 7};
+    const std::vector<int64_t> second_prompt = {0, 1};
+    auto first = make_dflash_window_group(first_prompt, 12, /*request_id=*/0);
+    auto second = make_dflash_window_group(second_prompt, 6, /*request_id=*/1);
+    runner.set_initial_hidden_state(0, make_dflash_hidden_rows(8));
+    runner.set_initial_hidden_state(1, make_dflash_hidden_rows(2));
+    const ContinuousBatchingScheduler::Output::LinearAttentionPagingData no_linear_attention;
+    std::ignore = runner.forward({first, second},
+                                 make_output_for_sequences({{first->get_running_sequences()[0]->get_id(), no_linear_attention},
+                                                            {second->get_running_sequences()[0]->get_id(), no_linear_attention}},
+                                                           18));
+
+    auto ireq = runner.get_infer_request();
+    EXPECT_EQ(tensor_values<int64_t>(ireq.get_tensor("token_type_ids")),
+              (std::vector<int64_t>{0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1}));
+    std::vector<float> expected_hidden(18 * DFLASH_HIDDEN_SIZE, 0.0f);
+    std::iota(expected_hidden.begin(), expected_hidden.begin() + 8 * DFLASH_HIDDEN_SIZE, 1.0f);
+    std::iota(expected_hidden.begin() + 12 * DFLASH_HIDDEN_SIZE, expected_hidden.begin() + 14 * DFLASH_HIDDEN_SIZE, 1.0f);
+    EXPECT_EQ(tensor_values<float>(ireq.get_tensor("hidden_states")), expected_hidden);
+    EXPECT_EQ(tensor_values<int64_t>(ireq.get_tensor("sampled_tokens_indices")),
+              (std::vector<int64_t>{9, 10, 11, 15, 16, 17}));
+    EXPECT_EQ(first->get_output_seq_len(), 3);
+    EXPECT_EQ(second->get_output_seq_len(), 3);
 }

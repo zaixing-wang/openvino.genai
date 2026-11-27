@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import atexit
+import bisect
 import queue
 import threading
 import multiprocessing
@@ -932,8 +933,17 @@ class MemorySamplerBase(MemorySampler):
         nsys_mem = 100 * float(sys_mem) / psutil.virtual_memory().total
         return [rss_mem, vms_mem, priv_mem, sys_mem, nsys_mem]
 
+    def read_raw(self):
+        """
+        Take a single raw memory snapshot without touching the running
+        statistics. Values are returned in ``self.metrics`` order so a caller
+        can defer aggregation (:meth:`aggregate_and_format`) until the sample's
+        marker is finalized. See :meth:`collect` for the eager variant.
+        """
+        return self._collect_ram_values()
+
     def collect(self, marker):
-        return self.aggregate_and_format(marker, self._collect_ram_values())
+        return self.aggregate_and_format(marker, self.read_raw())
 
 
 class MemorySamplerFull(MemorySamplerBase):
@@ -998,7 +1008,12 @@ class MemorySamplerFull(MemorySamplerBase):
             getattr(mem_info, "swap", 0),
         )
 
-    def collect(self, marker):
+    def read_raw(self):
+        """
+        Raw snapshot (no aggregation) in ``self.metrics`` order:
+        ``rss, vms, priv, sys, nsys, uss, pss, swap``. See
+        :meth:`MemorySamplerBase.read_raw`.
+        """
         parent_process = psutilProcess(self.process_id)
         rss_mem, vms_mem, priv_mem, uss_mem, pss_mem, swap_mem = self._full_info_values(parent_process)
         for child_proc in parent_process.children(recursive=True):
@@ -1012,8 +1027,101 @@ class MemorySamplerFull(MemorySamplerBase):
         sys_mem = psutil.virtual_memory().total - psutil.virtual_memory().available
         nsys_mem = 100 * float(sys_mem) / psutil.virtual_memory().total
         # Order must match self.metrics: rss, vms, priv, sys, nsys, uss, pss, swap.
-        vals = [rss_mem, vms_mem, priv_mem, sys_mem, nsys_mem, uss_mem, pss_mem, swap_mem]
-        return self.aggregate_and_format(marker, vals)
+        return [rss_mem, vms_mem, priv_mem, sys_mem, nsys_mem, uss_mem, pss_mem, swap_mem]
+
+    def collect(self, marker):
+        return self.aggregate_and_format(marker, self.read_raw())
+
+
+class _RusageInfoV0(ctypes.Structure):
+    """``struct rusage_info_v0`` of macOS ``<sys/resource.h>`` (flavor
+    ``RUSAGE_INFO_V0``): the fields up to ``ri_proc_exit_abstime``, all
+    ``uint64_t`` after the 16-byte UUID."""
+
+    _fields_ = [("ri_uuid", ctypes.c_uint8 * 16)] + [
+        (name, ctypes.c_uint64)
+        for name in (
+            "ri_user_time",
+            "ri_system_time",
+            "ri_pkg_idle_wkups",
+            "ri_interrupt_wkups",
+            "ri_pageins",
+            "ri_wired_size",
+            "ri_resident_size",
+            "ri_phys_footprint",
+            "ri_proc_start_abstime",
+            "ri_proc_exit_abstime",
+        )
+    ]
+
+
+class MemorySamplerMac(MemorySamplerBase):
+    """
+    macOS memory sampler ("MAC").
+
+    Extends :class:`MemorySamplerBase` -- the same ``rss`` / ``vms`` / ``priv``
+    / ``sys`` / ``nsys`` metrics -- with ``foot``, the process's **physical
+    footprint**: the memory figure macOS itself uses for a process (Activity
+    Monitor's "Memory" column, the one memory-pressure decisions are based
+    on). Unlike RSS it counts compressed pages and the memory the GPU driver
+    (IOKit / Metal) allocated for the process -- on Apple Silicon's unified
+    memory that is where GPU allocations show -- and unlike VMS (the virtual
+    address space, ~1 TiB for a Python + PyTorch / OpenVINO process) it is not
+    inflated by reserved but unused mappings. ``memory_info()`` has no USS /
+    private counters on macOS, so ``foot`` is the per-process "real usage"
+    there.
+
+    ``foot`` comes from ``proc_pid_rusage(pid, RUSAGE_INFO_V0)`` ->
+    ``ri_phys_footprint`` of ``libproc`` (via ``ctypes``, no extra package),
+    summed over the monitored process and all its descendants like the other
+    per-process metrics. A process whose usage can not be read (it exited,
+    no permission) counts 0. macOS only.
+    """
+
+    RUSAGE_INFO_V0 = 0
+    chunk_size = 8192
+    metrics = OrderedDict(
+        list(MemorySamplerBase.metrics.items()) + [("foot", {"denom": 1048576, "unit": "MiB", "digits": 3, "cv": True})]
+    )
+    _libproc = None
+
+    @classmethod
+    def load_libproc(cls):
+        """The ``libproc`` library (``proc_pid_rusage``), loaded once."""
+        if cls._libproc is None:
+            path = ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib"
+            lib = ctypes.CDLL(path, use_errno=True)
+            lib.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(_RusageInfoV0)]
+            lib.proc_pid_rusage.restype = ctypes.c_int
+            cls._libproc = lib
+        return cls._libproc
+
+    def __init__(self, process_id):
+        MemorySamplerBase.__init__(self, process_id)
+        self.load_libproc()
+
+    @classmethod
+    def phys_footprint(cls, pid):
+        """Physical footprint of *pid* in bytes; 0 when it can not be read."""
+        info = _RusageInfoV0()
+        if cls.load_libproc().proc_pid_rusage(int(pid), cls.RUSAGE_INFO_V0, ctypes.byref(info)) != 0:
+            return 0
+        return int(info.ri_phys_footprint)
+
+    def read_raw(self):
+        """
+        Raw snapshot (no aggregation) in ``self.metrics`` order:
+        ``rss, vms, priv, sys, nsys, foot``. See :meth:`MemorySamplerBase.read_raw`.
+        """
+        values = self._collect_ram_values()
+        parent_process = psutilProcess(self.process_id)
+        foot_mem = self.phys_footprint(parent_process.pid)
+        for child_proc in parent_process.children(recursive=True):
+            foot_mem += self.phys_footprint(child_proc.pid)
+        return values + [foot_mem]
+
+    def collect(self, marker):
+        return self.aggregate_and_format(marker, self.read_raw())
 
 
 class MemorySamplerWinGPU(MemorySamplerBase):
@@ -1230,11 +1338,13 @@ class MemorySamplerWinGPU(MemorySamplerBase):
     # MemorySampler protocol
     # ------------------------------------------------------------------
 
-    def collect(self, marker):
+    def read_raw(self):
         """
-        Take a single snapshot: RAM counters via the inherited
+        Raw snapshot (no aggregation): RAM counters via the inherited
         :meth:`MemorySamplerBase._collect_ram_values` (psutil, parent + all
         descendants) plus per-adapter GPU memory via :meth:`_collect_gpu_mem`.
+        Values are in ``self.metrics`` order. See
+        :meth:`MemorySamplerBase.read_raw`.
         """
         vals = self._collect_ram_values()
         vals.extend(self._collect_gpu_mem())  # flat (ded_0, shr_0, ded_1, shr_1, …)
@@ -1249,7 +1359,11 @@ class MemorySamplerWinGPU(MemorySamplerBase):
                 f"({len(vals)} values vs {len(self.metrics)} metrics) "
                 "— GPU adapter set may have changed; sample stats may be unreliable."
             )
-        return self.aggregate_and_format(marker, vals)
+        return vals
+
+    def collect(self, marker):
+        """Eager variant: snapshot via :meth:`read_raw` and aggregate at once."""
+        return self.aggregate_and_format(marker, self.read_raw())
 
 
 class MemoryMarkerMonitor(list):
@@ -1266,7 +1380,12 @@ class MemoryMarkerMonitor(list):
         #                                    up front by MemoryMarkerHandler.
         #   "full"    → MemorySamplerFull:   MemorySamplerBase (same RAM metrics) PLUS
         #                                    uss/pss/swap from psutil.memory_full_info().
-        #                                    Linux only; falls back to MemorySamplerBase
+        #                                    Linux only; on macOS falls back to
+        #                                    MemorySamplerMac, elsewhere to
+        #                                    MemorySamplerBase, with a warning.
+        #   "mac"     → MemorySamplerMac:    MemorySamplerBase (same RAM metrics) PLUS
+        #                                    foot (physical footprint, libproc).
+        #                                    macOS only; falls back to MemorySamplerBase
         #                                    elsewhere with a warning.
         if sampler_type == "win-gpu" and sys.platform == "win32":
             log.info("Memory worker: MemorySamplerWinGPU (psutil RAM + WMI GPU) init...")
@@ -1274,6 +1393,14 @@ class MemoryMarkerMonitor(list):
         elif sampler_type == "full" and sys.platform == "linux":
             log.info("Memory worker: MemorySamplerFull (psutil memory_full_info: +uss/pss/swap) init...")
             self.sampler = MemorySamplerFull(process_id)
+        elif sampler_type in ("mac", "full") and sys.platform == "darwin":
+            if sampler_type == "full":
+                log.warning(
+                    "Memory worker: --memory_sampler full requested but MemorySamplerFull is "
+                    "only available on Linux — using MemorySamplerMac (+foot) on macOS."
+                )
+            log.info("Memory worker: MemorySamplerMac (psutil RAM + libproc phys_footprint) init...")
+            self.sampler = MemorySamplerMac(process_id)
         else:
             if sampler_type == "win-gpu":
                 log.warning(
@@ -1285,6 +1412,11 @@ class MemoryMarkerMonitor(list):
                     "Memory worker: --memory_sampler full requested but MemorySamplerFull is "
                     "only available on Linux — falling back to MemorySamplerBase."
                 )
+            elif sampler_type == "mac":
+                log.warning(
+                    "Memory worker: --memory_sampler mac requested but MemorySamplerMac is "
+                    "only available on macOS — falling back to MemorySamplerBase."
+                )
             log.info("Memory worker: MemorySamplerBase (psutil cross-platform) init...")
             self.sampler = MemorySamplerBase(process_id)
         self.sampling_interval = float(sampling_interval)
@@ -1292,9 +1424,28 @@ class MemoryMarkerMonitor(list):
         self.last_ts = time.perf_counter()
         self.start_perf = time.perf_counter()
         self.start_time_ns = time.time_ns()
-        self.marker = "start"
         self.marker_queue = marker_queue
         self.should_stop = False
+
+        # Marker history and watermark for timestamp-based marker assignment.
+        #
+        # Samples carry a wall-clock ``ts`` (see collect_samples). Markers now
+        # arrive stamped with the caller's wall-clock time, so instead of
+        # tagging a sample with "whatever marker was read last" we look up the
+        # marker whose interval covers the sample's ``ts`` (marker_for()).
+        #
+        # Markers are sent in non-decreasing timestamp order, so once the
+        # latest received marker has timestamp ``watermark_ts`` no future marker
+        # can change the label of a sample with ``ts < watermark_ts``. Such
+        # samples are "finalized" and safe to flush to disk / aggregate; samples
+        # at or after the watermark stay buffered until the next marker advances
+        # it (or until "stop" finalizes everything). This makes file rewriting
+        # unnecessary and lets stats be aggregated at flush time, when a
+        # sample's marker is already final.
+        self.marker_history = [(self.start_time_ns, "start")]
+        self._marker_ts = [self.start_time_ns]  # parallel key list for bisect
+        self.watermark_ts = self.start_time_ns
+        self.flush_all = False  # set on "stop": finalize (flush) every sample
 
         self.path_prefix = Path(path_prefix)
         self.path_prefix.mkdir(parents=True, exist_ok=True)
@@ -1304,6 +1455,23 @@ class MemoryMarkerMonitor(list):
             self.collect_samples()
         except Exception as e:
             print(f"Warning: Initial sample collection failed: {e}")
+
+    def marker_for(self, ts):
+        """Return the marker whose interval covers sample timestamp ``ts`` —
+        the last history entry with ``entry_ts <= ts`` (clamped to the first
+        entry for samples that predate every recorded marker)."""
+        idx = bisect.bisect_right(self._marker_ts, ts) - 1
+        if idx < 0:
+            idx = 0
+        return self.marker_history[idx][1]
+
+    def _record_marker(self, marker, ts):
+        """Append a received marker to the history, enforcing a non-decreasing
+        timestamp order, and advance the watermark."""
+        ts = max(int(ts), self.watermark_ts)  # guard against clock going backwards
+        self.marker_history.append((ts, marker))
+        self._marker_ts.append(ts)
+        self.watermark_ts = ts
 
     def deduce_filename(self, report_json=False):
         def fnfunc(path_prefix, process_id, file_counter):
@@ -1316,26 +1484,42 @@ class MemoryMarkerMonitor(list):
         return fnfunc(self.path_prefix, self.process_id, self.file_counter)
 
     def check_for_markers(self):
-        latest_marker = None
+        """Drain every pending marker (not just the latest) into the marker
+        history. Each queue item is a ``(marker, timestamp_ns)`` tuple; a bare
+        string is accepted defensively and stamped with "now". "stop" is a
+        control signal — it finalizes all samples and is not recorded as a
+        sample label."""
         stop_received = False
         try:
             while True:
                 try:
-                    marker = self.marker_queue.get_nowait()
-                    latest_marker = marker
-                    if marker == "stop":
-                        stop_received = True
-                        break
+                    item = self.marker_queue.get_nowait()
                 except queue.Empty:
                     break
-            if latest_marker is not None:
-                self.marker = latest_marker
+
+                if isinstance(item, tuple):
+                    marker, ts = item
+                else:  # legacy / defensive: bare marker string, stamp with now
+                    marker, ts = item, self._now_ns()
+
+                if marker == "stop":
+                    stop_received = True
+                    break
+                self._record_marker(marker, ts)
+
             if stop_received:
                 self.should_stop = True
+                self.flush_all = True  # finalize every buffered sample
                 return True
         except Exception as e:
             print(f"Error checking markers: {e}")
         return False
+
+    def _now_ns(self):
+        """Current wall-clock ns in the same domain as sample timestamps
+        (anchored at start_time_ns, advanced by the monotonic perf_counter)."""
+        elapsed_ns = int((time.perf_counter() - self.start_perf) * 1_000_000_000)
+        return self.start_time_ns + elapsed_ns
 
     def loop(self, metadata):
         count_error = 0
@@ -1344,7 +1528,6 @@ class MemoryMarkerMonitor(list):
                 print("Memory worker: Received stop signal")
                 try:
                     self.collect_samples()
-                    print(self.sampler)
                 except Exception as e:
                     print(f"Final sample failed: {e}")
                 break
@@ -1364,7 +1547,12 @@ class MemoryMarkerMonitor(list):
             if count_error > 32:
                 print("Memory worker: too many errors: stop!")
                 break
+        # Ensure everything left in the buffer is finalized and flushed, then
+        # write the report. flush_all guarantees the final write_chunk drains
+        # the whole buffer even if "stop" was not the trigger (e.g. error exit).
+        self.flush_all = True
         self.write_final_results(metadata)
+        print(self.sampler)
 
     def sampling_sleep(self):
         elapsed = time.perf_counter() - self.last_ts
@@ -1387,34 +1575,55 @@ class MemoryMarkerMonitor(list):
             json.dump(data, fd, indent=2)
         log.info(f"MemoryMonitor: save summary: {fname}")
 
+    def _pop_finalized(self):
+        """Pop and return the front (oldest) buffered samples whose marker is
+        finalized — i.e. ``ts < watermark_ts`` (or all of them once "stop" has
+        set flush_all). The buffer is time-ordered, so the finalized samples are
+        a contiguous prefix. Each entry is ``(ts, *raw_vals)``."""
+        cutoff = math.inf if self.flush_all else self.watermark_ts
+        finalized = []
+        while self and self[0][0] < cutoff:
+            finalized.append(self.pop(0))
+        return finalized
+
     def write_chunk(self):
-        if not self:
-            return
         try:
-            counter = len(self)
+            finalized = self._pop_finalized()
+            if not finalized:
+                return
+            counter = len(finalized)
             fname = self.deduce_filename()
             with open(fname, "w", encoding="utf-8") as fd:
                 fd.write(f"#ts marker {self.sampler.header}\n")
                 lines = []
-                while self:
-                    row = self.pop(0)
-                    lines.append(" ".join(map(str, row)))
+                for ts, *raw_vals in finalized:
+                    # Marker is resolved now, from the (complete-for-this-ts)
+                    # history, and stats are aggregated here rather than at
+                    # collection time — the label can no longer change.
+                    marker = self.marker_for(ts)
+                    formatted = self.sampler.aggregate_and_format(marker, raw_vals)
+                    self.sampler.timing(ts / 1_000_000_000, marker)
+                    lines.append(" ".join(map(str, (ts, marker, *formatted))))
                 fd.write("\n".join(lines))
                 fd.write(f"\n#number of samples: {counter}\n")
         except Exception as e:
             print(f"Error writing chunk: {e}")
 
-    def collect_samples(self, forced_marker=None):
-        marker = self.marker if forced_marker is None else forced_marker
+    def collect_samples(self):
+        """Take a raw memory snapshot and buffer it as ``(ts, *raw_vals)``.
+
+        The marker is deliberately NOT assigned here: a late-arriving marker may
+        still change the label of a just-collected sample. The final marker is
+        resolved from the history at flush time (write_chunk), once the sample's
+        ``ts`` is below the watermark. Statistics are aggregated there too."""
         try:
-            vals = self.sampler.collect(marker)
+            raw_vals = self.sampler.read_raw()
             self.last_ts = time.perf_counter()
-            self.sampler.timing(self.last_ts, marker)
 
             elapsed_seconds = self.last_ts - self.start_perf
             elapsed_ns = int(elapsed_seconds * 1_000_000_000)
             ts = self.start_time_ns + elapsed_ns
-            self.append((ts, marker, *vals))
+            self.append((ts, *raw_vals))
         except Exception as err:
             raise Exception(err)
 
@@ -1540,9 +1749,15 @@ class MemoryMarkerHandler:
                 print(f"Warning: Invalid marker '{marker}'")
                 return False
 
+            # Stamp the marker with the caller's wall-clock time so the sampler
+            # can attribute it to the samples that were actually taken during
+            # this phase, instead of to whichever sample happens to be next when
+            # the background loop drains the queue. time.time_ns() shares the
+            # system clock with the sampler's timestamps, so the two are
+            # directly comparable across processes.
             # Non-blocking put with timeout
             log.info(f"MemoryMonitor: try to send new marker: {marker}")
-            self.marker_queue.put(marker, timeout=0.1)
+            self.marker_queue.put((marker, time.time_ns()), timeout=0.1)
             return True
 
         except queue.Full:
